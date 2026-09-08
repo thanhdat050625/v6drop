@@ -9,13 +9,14 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Giới hạn tối đa đúng 5 chunk trong RAM (5 * 256KB = 1.28MB RAM)
-// Cho phép truyền gối đầu (pipelining) để bên nhận tải về liên tục không bị khựng
-const MaxChunksInRam = 5
+// Giới hạn tối đa 8 chunk trong RAM (8 * 256KB = 2.0MB RAM)
+// Cho phép truyền gối đầu (pipelining): Server luôn duy trì tối đa 8 chunk,
+// cứ thiếu 1 chunk là server báo ACK để bên gửi bơm bù ngay lập tức!
+const MaxChunksInRam = 8
 
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  256 * 1024,
-	WriteBufferSize: 256 * 1024,
+	ReadBufferSize:  1024 * 1024,
+	WriteBufferSize: 1024 * 1024,
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
@@ -167,8 +168,8 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		rcvStop := make(chan struct{})
 		defer close(rcvStop)
 
-		// Goroutine chuyên trách đọc từ Queue (tối đa 5 chunk) và gửi ra Receiver liên tục
-		go func(rcvConn *SafeConn, q chan RelayMessage, stop chan struct{}) {
+		// Goroutine chuyên trách đọc từ Queue (tối đa 8 chunk) và gửi ra Receiver liên tục
+		go func(rcvConn *SafeConn, q chan RelayMessage, stop chan struct{}, rm *Room) {
 			for {
 				select {
 				case msg, ok := <-q:
@@ -178,11 +179,23 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 					if err := rcvConn.WriteMessage(msg.MsgType, msg.Data); err != nil {
 						return
 					}
+					// Nếu đây là chunk dữ liệu nhị phân:
+					// Ngay khi Server lấy 1 chunk ra khỏi RAM và đẩy cho Receiver thành công,
+					// trong RAM server vừa hụt 1 chunk (< MaxChunksInRam).
+					// Server báo ngay ACK cho Bên Gửi để Bên Gửi bơm ngay 1 chunk tiếp theo bù vào!
+					if msg.MsgType == websocket.BinaryMessage {
+						rm.Lock.Lock()
+						snd := rm.Sender
+						rm.Lock.Unlock()
+						if snd != nil {
+							_ = snd.WriteMessage(websocket.TextMessage, []byte("ACK"))
+						}
+					}
 				case <-stop:
 					return
 				}
 			}
-		}(sConn, room.Queue, rcvStop)
+		}(sConn, room.Queue, rcvStop, room)
 	}
 	room.Lock.Unlock()
 
@@ -201,18 +214,28 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if role == "sender" {
-			// BÊN GỬI -> BÊN NHẬN (Đưa vào Queue tối đa 5 chunk = 320KB RAM)
-			// Nếu trong RAM đã có 5 chunk chưa kịp tải về, dòng này tự động BLOCK,
-			// ép socket TCP của bên gửi dừng đọc -> tự động hãm tốc độ bên gửi (Backpressure)
-			room.Queue <- RelayMessage{MsgType: msgType, Data: data}
+			// Nếu là tin nhắn TextMessage (Metadata JSON...):
+			// Gửi trực tiếp cho Receiver ngay lập tức, không chiếm slot của chunk trong Queue
+			if msgType == websocket.TextMessage {
+				room.Lock.Lock()
+				rcv := room.Receiver
+				room.Lock.Unlock()
+				if rcv != nil {
+					_ = rcv.WriteMessage(msgType, data)
+				}
+			} else {
+				// Binary chunk dữ liệu -> Đưa vào Queue (tối đa MaxChunksInRam = 8)
+				// Nếu trong RAM đã có đủ 8 chunk, dòng này tự động BLOCK (Backpressure tự nhiên của TCP)
+				room.Queue <- RelayMessage{MsgType: msgType, Data: data}
+			}
 		} else {
-			// BÊN NHẬN -> BÊN GỬI (Tín hiệu ACK phản hồi kiểm soát luồng gối đầu)
+			// BÊN NHẬN -> BÊN GỬI (Tín hiệu điều khiển: READY, VERIFY_OK, VERIFY_FAIL...)
 			room.Lock.Lock()
 			sender := room.Sender
 			room.Lock.Unlock()
 			if sender != nil {
 				if err := sender.WriteMessage(msgType, data); err != nil {
-					log.Printf("[%s] Lỗi gửi ACK tới Sender: %v\n", roomID, err)
+					log.Printf("[%s] Lỗi gửi tin tới Sender: %v\n", roomID, err)
 				}
 			}
 		}
