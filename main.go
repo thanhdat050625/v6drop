@@ -212,16 +212,12 @@ func main() {
 		port = "10000"
 	}
 
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("v6drop Go relay server is running healthy!"))
+		w.Write([]byte("ok"))
 	})
 
 	http.HandleFunc("/ws", handleWS)
-
-	// Phục vụ frontend static files trong thư mục ./public
-	fs := http.FileServer(http.Dir("./public"))
-	http.Handle("/", fs)
 
 	log.Printf("v6drop Go Relay Server đang chạy tại cổng %s (Buffer RAM: tối đa %d chunks)\n", port, MaxChunksInRam)
 	server := &http.Server{
