@@ -254,7 +254,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, params: WsParams) {
                 }
             },
             Err(e) => {
-                warn!("WebSocket read error trên peer '{}': {}", read_peer_id, e);
+                let err_str = e.to_string();
+                if err_str.contains("Connection reset without closing handshake")
+                    || err_str.contains("connection closed before message completed")
+                    || err_str.contains("Connection reset by peer")
+                    || err_str.contains("reset without closing")
+                {
+                    debug!("Peer '{}' ngắt kết nối (tắt tab/khóa máy): {}", read_peer_id, err_str);
+                } else {
+                    warn!("WebSocket read error trên peer '{}': {}", read_peer_id, err_str);
+                }
                 break;
             }
         }
