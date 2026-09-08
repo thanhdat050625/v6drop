@@ -18,7 +18,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::sync::{mpsc, RwLock};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 type PeerSender = mpsc::UnboundedSender<Message>;
 
