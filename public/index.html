@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>v6drop - Truyền File &amp; Video Tốc Độ Cao (Go Relay + Backpressure)</title>
+  <meta name="description" content="Hệ thống truyền tải file siêu tốc qua WebSocket Relay với cơ chế Flow Control Backpressure ACK và Web Worker SHA-256">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-base: #0b0f19;
+      --bg-card: rgba(18, 24, 38, 0.85);
+      --bg-card-hover: rgba(24, 32, 52, 0.9);
+      --border-color: rgba(255, 255, 255, 0.08);
+      --primary: #3b82f6;
+      --primary-hover: #2563eb;
+      --accent: #10b981;
+      --accent-hover: #059669;
+      --danger: #ef4444;
+      --text-main: #f3f4f6;
+      --text-muted: #9ca3af;
+      --radius: 12px;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg-base);
+      color: var(--text-main);
+      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px 16px;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 780px;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 28px;
+      font-weight: 800;
+      color: #fff;
+    }
+
+    .brand .tag {
+      font-size: 12px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: linear-gradient(135deg, #3b82f6, #10b981);
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+
+    .subtitle {
+      color: var(--text-muted);
+      font-size: 14px;
+      margin-top: 6px;
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 20px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+      backdrop-filter: blur(12px);
+    }
+
+    .card h3 {
+      font-size: 17px;
+      font-weight: 700;
+      margin-bottom: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .form-group {
+      margin-bottom: 14px;
+    }
+
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+
+    .input-row {
+      display: flex;
+      gap: 10px;
+    }
+
+    input[type="text"] {
+      flex: 1;
+      padding: 10px 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border-color);
+      background: rgba(0, 0, 0, 0.4);
+      color: #fff;
+      font-family: inherit;
+      font-size: 14px;
+      outline: none;
+    }
+
+    input[type="text"]:focus {
+      border-color: var(--primary);
+    }
+
+    .btn {
+      padding: 10px 18px;
+      border-radius: 8px;
+      border: none;
+      font-weight: 600;
+      font-size: 14px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s ease;
+      color: #fff;
+    }
+
+    .btn-primary { background: var(--primary); }
+    .btn-primary:hover { background: var(--primary-hover); }
+    .btn-accent { background: var(--accent); }
+    .btn-accent:hover { background: var(--accent-hover); }
+    .btn-secondary { background: rgba(255, 255, 255, 0.1); }
+    .btn-secondary:hover { background: rgba(255, 255, 255, 0.15); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .grid-panels {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    @media (max-width: 680px) {
+      .grid-panels { grid-template-columns: 1fr; }
+    }
+
+    .drop-zone {
+      border: 2px dashed rgba(255, 255, 255, 0.15);
+      border-radius: 8px;
+      padding: 24px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+
+    .drop-zone:hover {
+      border-color: var(--primary);
+    }
+
+    .progress-bar-wrap {
+      width: 100%;
+      height: 10px;
+      background: rgba(255, 255, 255, 0.08);
+      border-radius: 6px;
+      overflow: hidden;
+      margin: 12px 0 8px 0;
+    }
+
+    .progress-fill {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #3b82f6, #10b981);
+      transition: width 0.15s ease;
+    }
+
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-top: 14px;
+      text-align: center;
+    }
+
+    .metric-box {
+      background: rgba(0, 0, 0, 0.3);
+      padding: 8px;
+      border-radius: 6px;
+    }
+
+    .metric-val {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 15px;
+      font-weight: 700;
+      color: #60a5fa;
+    }
+
+    .metric-lbl {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    .log-box {
+      background: rgba(0, 0, 0, 0.5);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 12px;
+      height: 140px;
+      overflow-y: auto;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      color: #cbd5e1;
+    }
+
+    .log-line {
+      margin-bottom: 4px;
+      line-height: 1.4;
+    }
+
+    .badge-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.06);
+      font-weight: 600;
+      margin-top: 6px;
+    }
+
+    .badge-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #9ca3af;
+    }
+
+    .status-active .badge-dot { background: #10b981; box-shadow: 0 0 8px #10b981; }
+    .status-waiting .badge-dot { background: #f59e0b; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <span>⚡ v6drop</span>
+        <span class="tag">Go Relay Core</span>
+      </div>
+      <p class="subtitle">Truyền file dung lượng lớn qua WebSocket Relay • Backpressure Flow Control • Web Worker Checksum</p>
+    </header>
+
+    <!-- Room Setup -->
+    <div class="card">
+      <label for="roomId">Mã phòng (Room ID)</label>
+      <div class="input-row">
+        <input type="text" id="roomId" value="phong-1" placeholder="Nhập mã phòng...">
+        <button type="button" class="btn btn-secondary" id="btnRandom">🎲 Ngẫu nhiên</button>
+      </div>
+    </div>
+
+    <!-- Dual Role Grid -->
+    <div class="grid-panels">
+      <!-- Sender Panel -->
+      <div class="card" id="senderCard">
+        <h3>📤 1. Bên Gửi (Sender)</h3>
+        <div class="drop-zone" id="dropZone">
+          <p>📁 Kéo thả file hoặc bấm vào đây để chọn file</p>
+          <input type="file" id="fileInput" style="display: none;">
+        </div>
+        <div id="fileSelectedInfo" style="margin-top: 10px; font-size: 13px; display: none;">
+          <strong>File:</strong> <span id="lblFileName">-</span> (<span id="lblFileSize">0 MB</span>)
+        </div>
+        <br>
+        <button type="button" class="btn btn-primary" id="btnStartSend" style="width: 100%;">
+          🚀 Gửi File
+        </button>
+      </div>
+
+      <!-- Receiver Panel -->
+      <div class="card" id="receiverCard">
+        <h3>📥 2. Bên Nhận (Receiver)</h3>
+        <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 14px;">
+          Bấm nút bên dưới để chờ file từ Bên Gửi. Dữ liệu sẽ tự động tải về khi nhận đủ.
+        </p>
+        <button type="button" class="btn btn-accent" id="btnStartReceive" style="width: 100%;">
+          🎯 Sẵn sàng nhận
+        </button>
+        <div id="receiverStatusBadge" class="badge-status status-waiting" style="display: none; margin-top: 14px;">
+          <span class="badge-dot"></span>
+          <span id="lblReceiverStatus">Đang chờ bên gửi truyền dữ liệu...</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Progress & Metrics Section -->
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; font-size: 14px; font-weight: 600;">
+        <span id="lblStatus">Trạng thái: Sẵn sàng</span>
+        <span id="lblPercent">0%</span>
+      </div>
+      <div class="progress-bar-wrap">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+      <div class="metrics-grid">
+        <div class="metric-box">
+          <div class="metric-val" id="valSpeed">0 MB/s</div>
+          <div class="metric-lbl">Tốc độ truyền</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-val" id="valTransferred">0 / 0 MB</div>
+          <div class="metric-lbl">Dung lượng</div>
+        </div>
+        <div class="metric-box">
+          <div class="metric-val" id="valEta">--:--</div>
+          <div class="metric-lbl">Thời gian còn lại</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Diagnostic Console -->
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+        <label style="margin: 0;">📋 Nhật ký hoạt động</label>
+        <button type="button" class="btn btn-secondary" id="btnClearLog" style="padding: 4px 10px; font-size: 12px;">Xóa log</button>
+      </div>
+      <div class="log-box" id="logBox">
+        <div class="log-line">[System] Sẵn sàng truyền nhận file qua Go Relay.</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const CHUNK_SIZE = 256 * 1024; // 256KB - Tối ưu cho mạng 4G/Wi-Fi
+    let ws = null;
+    let keepAliveTimer = null;
+
+    const UI = {
+      roomId: document.getElementById('roomId'),
+      btnRandom: document.getElementById('btnRandom'),
+      fileInput: document.getElementById('fileInput'),
+      dropZone: document.getElementById('dropZone'),
+      fileSelectedInfo: document.getElementById('fileSelectedInfo'),
+      lblFileName: document.getElementById('lblFileName'),
+      lblFileSize: document.getElementById('lblFileSize'),
+      btnStartSend: document.getElementById('btnStartSend'),
+      btnStartReceive: document.getElementById('btnStartReceive'),
+      receiverStatusBadge: document.getElementById('receiverStatusBadge'),
+      lblReceiverStatus: document.getElementById('lblReceiverStatus'),
+      lblStatus: document.getElementById('lblStatus'),
+      lblPercent: document.getElementById('lblPercent'),
+      progressFill: document.getElementById('progressFill'),
+      valSpeed: document.getElementById('valSpeed'),
+      valTransferred: document.getElementById('valTransferred'),
+      valEta: document.getElementById('valEta'),
+      logBox: document.getElementById('logBox'),
+      btnClearLog: document.getElementById('btnClearLog')
+    };
+
+    function log(msg) {
+      const time = new Date().toLocaleTimeString();
+      const line = document.createElement('div');
+      line.className = 'log-line';
+      line.textContent = `[${time}] ${msg}`;
+      UI.logBox.appendChild(line);
+      UI.logBox.scrollTop = UI.logBox.scrollHeight;
+      console.log(msg);
+    }
+
+    function formatBytes(bytes) {
+      if (!bytes || bytes === 0) return '0 B';
+      const k = 1024;
+      const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+
+    function getWsUrl(role) {
+      // Tự động xác định địa chỉ: Nếu chạy local thì dùng wss://v6drop-nganhang5742.onrender.com, nếu chạy trên Render thì dùng location.host
+      let host = location.host;
+      let proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      if (!host || host.startsWith('127.0.0.1') || host.startsWith('localhost') || location.protocol === 'file:') {
+        return `wss://v6drop-nganhang5742.onrender.com/ws?room=${encodeURIComponent(UI.roomId.value.trim())}&role=${role}`;
+      }
+      return `${proto}//${host}/ws?room=${encodeURIComponent(UI.roomId.value.trim())}&role=${role}`;
+    }
+
+    function startKeepAlive() {
+      stopKeepAlive();
+      keepAliveTimer = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'ping' }));
+        }
+      }, 20000);
+    }
+
+    function stopKeepAlive() {
+      if (keepAliveTimer) {
+        clearInterval(keepAliveTimer);
+        keepAliveTimer = null;
+      }
+    }
+
+    // Sự kiện chọn file
+    UI.btnRandom.addEventListener('click', () => {
+      const rand = Math.random().toString(36).substring(2, 8);
+      UI.roomId.value = `phong-${rand}`;
+    });
+
+    UI.dropZone.addEventListener('click', () => UI.fileInput.click());
+    UI.fileInput.addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (file) {
+        UI.lblFileName.textContent = file.name;
+        UI.lblFileSize.textContent = formatBytes(file.size);
+        UI.fileSelectedInfo.style.display = 'block';
+        log(`Đã chọn file: ${file.name} (${formatBytes(file.size)})`);
+      }
+    });
+
+    UI.btnClearLog.addEventListener('click', () => {
+      UI.logBox.innerHTML = '';
+      log('Đã xóa log.');
+    });
+
+    // ==========================================
+    // 1. XỬ LÝ BÊN GỬI (SENDER)
+    // ==========================================
+    UI.btnStartSend.addEventListener('click', async () => {
+      const file = UI.fileInput.files[0];
+      if (!file) {
+        alert('Vui lòng chọn file trước khi gửi!');
+        return;
+      }
+
+      UI.btnStartSend.disabled = true;
+      UI.lblStatus.textContent = 'Đang tính toán Checksum SHA-256...';
+      log(`Bắt đầu tính Checksum SHA-256 cho file ${file.name}...`);
+
+      const worker = new Worker('worker.js');
+      worker.postMessage({ file, chunkSize: CHUNK_SIZE });
+
+      worker.onmessage = (e) => {
+        if (e.data.type === 'HASH_COMPLETE') {
+          const checksum = e.data.hash;
+          log(`Checksum: ${checksum.slice(0, 12)}... Kết nối Go Relay Server...`);
+          UI.lblStatus.textContent = 'Đang kết nối Server...';
+          uploadFile(file, checksum);
+        }
+      };
+
+      worker.onerror = (err) => {
+        log(`Lỗi Web Worker: ${err.message}`);
+        UI.btnStartSend.disabled = false;
+      };
+    });
+
+    function uploadFile(file, checksum) {
+      if (ws) ws.close();
+      const wsUrl = getWsUrl('sender');
+      log(`Kết nối: ${wsUrl}`);
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
+
+      let offset = 0;
+      let startTime = 0;
+      let lastSpeedTime = 0;
+      let lastSpeedBytes = 0;
+
+      ws.onopen = () => {
+        log('Đã kết nối Go Relay Server. Gửi Metadata file...');
+        startKeepAlive();
+        const meta = {
+          name: file.name,
+          size: file.size,
+          checksum: checksum,
+          totalChunks: Math.ceil(file.size / CHUNK_SIZE)
+        };
+        ws.send(JSON.stringify(meta));
+        UI.lblStatus.textContent = 'Đã gửi Metadata. Chờ Bên Nhận phản hồi ACK...';
+      };
+
+      ws.onmessage = (e) => {
+        if (typeof e.data === 'string') {
+          if (e.data === 'ACK') {
+            if (startTime === 0) {
+              startTime = performance.now();
+              lastSpeedTime = startTime;
+              lastSpeedBytes = 0;
+            }
+
+            if (offset < file.size) {
+              const slice = file.slice(offset, offset + CHUNK_SIZE);
+              slice.arrayBuffer().then((buf) => {
+                ws.send(buf);
+                offset += buf.byteLength;
+
+                const now = performance.now();
+                const totalElapsedSec = (now - startTime) / 1000;
+                const progress = Math.min(100, (offset / file.size) * 100);
+
+                UI.progressFill.style.width = `${progress}%`;
+                UI.lblPercent.textContent = `${progress.toFixed(1)}%`;
+                UI.lblStatus.textContent = `Đang gửi qua Go Relay (${progress.toFixed(1)}%)`;
+                UI.valTransferred.textContent = `${formatBytes(offset)} / ${formatBytes(file.size)}`;
+
+                // Tính tốc độ trung bình
+                if (now - lastSpeedTime >= 500) {
+                  const speedBytesPerSec = (offset - lastSpeedBytes) / ((now - lastSpeedTime) / 1000);
+                  const speedMB = speedBytesPerSec / (1024 * 1024);
+                  UI.valSpeed.textContent = `${speedMB.toFixed(2)} MB/s`;
+
+                  if (speedBytesPerSec > 0) {
+                    const remainingSec = (file.size - offset) / speedBytesPerSec;
+                    const mins = Math.floor(remainingSec / 60);
+                    const secs = Math.floor(remainingSec % 60);
+                    UI.valEta.textContent = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+                  }
+                  lastSpeedTime = now;
+                  lastSpeedBytes = offset;
+                }
+              });
+            } else {
+              const totalSec = ((performance.now() - startTime) / 1000).toFixed(1);
+              UI.progressFill.style.width = '100%';
+              UI.lblPercent.textContent = '100%';
+              UI.lblStatus.textContent = `🎉 Hoàn tất gửi file trong ${totalSec} giây!`;
+              log(`Đã gửi thành công toàn bộ file ${file.name} trong ${totalSec}s!`);
+              UI.btnStartSend.disabled = false;
+              stopKeepAlive();
+            }
+          } else {
+            try {
+              const parsed = JSON.parse(e.data);
+              if (parsed.type === 'PEER_CONNECTED' && parsed.role === 'receiver') {
+                log('Bên Nhận đã vào phòng và sẵn sàng nhận!');
+              } else if (parsed.type === 'PEER_DISCONNECTED') {
+                log('Bên Nhận đã ngắt kết nối.');
+              }
+            } catch (err) {}
+          }
+        }
+      };
+
+      ws.onerror = () => {
+        log('Lỗi kết nối WebSocket Bên Gửi!');
+        UI.btnStartSend.disabled = false;
+        stopKeepAlive();
+      };
+
+      ws.onclose = () => {
+        log('Kết nối WebSocket Bên Gửi đã đóng.');
+        UI.btnStartSend.disabled = false;
+        stopKeepAlive();
+      };
+    }
+
+    // ==========================================
+    // 2. XỬ LÝ BÊN NHẬN (RECEIVER)
+    // ==========================================
+    UI.btnStartReceive.addEventListener('click', () => {
+      UI.btnStartReceive.disabled = true;
+      UI.receiverStatusBadge.style.display = 'inline-flex';
+      UI.receiverStatusBadge.className = 'badge-status status-waiting';
+      UI.lblReceiverStatus.textContent = 'Đang kết nối Server...';
+
+      if (ws) ws.close();
+      const wsUrl = getWsUrl('receiver');
+      log(`Bên Nhận kết nối: ${wsUrl}`);
+      ws = new WebSocket(wsUrl);
+      ws.binaryType = 'arraybuffer';
+
+      let meta = null;
+      let receivedBytes = 0;
+      let chunks = [];
+      let startTime = 0;
+      let lastSpeedTime = 0;
+      let lastSpeedBytes = 0;
+
+      ws.onopen = () => {
+        log('Bên Nhận đã kết nối Server. Chờ Bên Gửi truyền Metadata...');
+        UI.receiverStatusBadge.className = 'badge-status status-active';
+        UI.lblReceiverStatus.textContent = 'Sẵn sàng nhận dữ liệu!';
+        startKeepAlive();
+      };
+
+      ws.onmessage = async (e) => {
+        // 1. Nhận Metadata
+        if (typeof e.data === 'string') {
+          if (e.data === '{"type":"pong"}') return;
+
+          try {
+            const parsed = JSON.parse(e.data);
+            if (parsed.name && parsed.size) {
+              meta = parsed;
+              receivedBytes = 0;
+              chunks = [];
+              startTime = performance.now();
+              lastSpeedTime = startTime;
+              lastSpeedBytes = 0;
+
+              log(`Bắt đầu nhận file: ${meta.name} (${formatBytes(meta.size)})`);
+              UI.lblStatus.textContent = `Đang nhận: ${meta.name}`;
+              UI.lblReceiverStatus.textContent = `Đang nhận: ${meta.name}`;
+              // Gửi ACK đầu tiên để Sender bắt đầu gửi chunk #1
+              ws.send('ACK');
+              return;
+            }
+          } catch (err) {}
+          return;
+        }
+
+        // 2. Nhận Binary Chunk
+        if (e.data instanceof ArrayBuffer) {
+          chunks.push(e.data);
+          receivedBytes += e.data.byteLength;
+
+          const now = performance.now();
+          const progress = Math.min(100, (receivedBytes / meta.size) * 100);
+
+          UI.progressFill.style.width = `${progress}%`;
+          UI.lblPercent.textContent = `${progress.toFixed(1)}%`;
+          UI.valTransferred.textContent = `${formatBytes(receivedBytes)} / ${formatBytes(meta.size)}`;
+
+          if (now - lastSpeedTime >= 500) {
+            const speedBytesPerSec = (receivedBytes - lastSpeedBytes) / ((now - lastSpeedTime) / 1000);
+            const speedMB = speedBytesPerSec / (1024 * 1024);
+            UI.valSpeed.textContent = `${speedMB.toFixed(2)} MB/s`;
+
+            if (speedBytesPerSec > 0) {
+              const remainingSec = (meta.size - receivedBytes) / speedBytesPerSec;
+              const mins = Math.floor(remainingSec / 60);
+              const secs = Math.floor(remainingSec % 60);
+              UI.valEta.textContent = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+            }
+            lastSpeedTime = now;
+            lastSpeedBytes = receivedBytes;
+          }
+
+          // Bắn ACK phản hồi cho Bên Gửi gửi tiếp chunk tiếp theo (Flow Control)
+          ws.send('ACK');
+
+          // 3. Khi nhận đủ 100% dung lượng
+          if (receivedBytes >= meta.size) {
+            const totalSec = ((performance.now() - startTime) / 1000).toFixed(1);
+            UI.lblStatus.textContent = 'Đang ghép file và kiểm tra Checksum...';
+            log(`Đã nhận đủ 100% (${formatBytes(receivedBytes)}) trong ${totalSec}s. Đang ghép file...`);
+
+            const fullBlob = new Blob(chunks);
+            chunks = []; // giải phóng mảng chunks
+
+            // Tự động tải file xuống
+            const downloadUrl = URL.createObjectURL(fullBlob);
+            const a = document.createElement('a');
+            a.href = downloadUrl;
+            a.download = meta.name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+
+            UI.lblStatus.textContent = `🎉 Hoàn tất nhận và lưu file ${meta.name}!`;
+            log(`Đã lưu file ${meta.name} vào máy tính thành công!`);
+            UI.btnStartReceive.disabled = false;
+            stopKeepAlive();
+          }
+        }
+      };
+
+      ws.onerror = () => {
+        log('Lỗi kết nối WebSocket Bên Nhận!');
+        UI.btnStartReceive.disabled = false;
+        stopKeepAlive();
+      };
+
+      ws.onclose = () => {
+        log('Kết nối WebSocket Bên Nhận đã đóng.');
+        UI.btnStartReceive.disabled = false;
+        stopKeepAlive();
+      };
+    });
+  </script>
+</body>
+</html>

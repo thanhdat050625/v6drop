@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: v6drop-nganhang5742
+    runtime: go
+    plan: free
+    region: singapore
+    buildCommand: go mod tidy && go build -o server main.go
+    startCommand: ./server
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 10000
