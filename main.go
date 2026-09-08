@@ -10,6 +10,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// Giới hạn tối đa đúng 10 chunk trong RAM (10 * 256KB = 2.5MB RAM)
+// Nếu bên gửi đẩy lên quá nhanh mà bên nhận chưa kịp đọc, server sẽ tự động hãm tốc độ bên gửi (Backpressure)
+const MaxChunksInRam = 10
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  256 * 1024,
 	WriteBufferSize: 256 * 1024,
@@ -18,10 +22,17 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+type RelayMessage struct {
+	MsgType int
+	Data    []byte
+}
+
 type Room struct {
-	Sender   *websocket.Conn
-	Receiver *websocket.Conn
-	Lock     sync.Mutex
+	Sender    *websocket.Conn
+	Receiver  *websocket.Conn
+	Queue     chan RelayMessage // Channel buffer giới hạn đúng 10 chunk trong RAM
+	StopChan  chan struct{}
+	Lock      sync.Mutex
 }
 
 var (
@@ -35,9 +46,23 @@ func getRoom(id string) *Room {
 	if r, exists := rooms[id]; exists {
 		return r
 	}
-	r := &Room{}
+	r := &Room{
+		Queue:    make(chan RelayMessage, MaxChunksInRam),
+		StopChan: make(chan struct{}),
+	}
 	rooms[id] = r
 	return r
+}
+
+// Xả sạch hàng đợi để giải phóng RAM ngay lập tức khi ngắt kết nối
+func drainQueue(ch chan RelayMessage) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
 }
 
 func removePeerFromRoom(roomID, role string, conn *websocket.Conn) {
@@ -62,12 +87,20 @@ func removePeerFromRoom(roomID, role string, conn *websocket.Conn) {
 		if room.Sender != nil {
 			_ = room.Sender.WriteMessage(websocket.TextMessage, []byte(`{"type":"PEER_DISCONNECTED","role":"receiver"}`))
 		}
+		// Xả sạch RAM nếu Receiver ngắt kết nối
+		drainQueue(room.Queue)
 	}
 
 	// Nếu cả 2 đều đã rời phòng, dọn dẹp sạch Room để giải phóng RAM
 	if room.Sender == nil && room.Receiver == nil {
+		select {
+		case <-room.StopChan:
+		default:
+			close(room.StopChan)
+		}
+		drainQueue(room.Queue)
 		delete(rooms, roomID)
-		log.Printf("[%s] Phòng đã rỗng và được giải phóng khỏi RAM\n", roomID)
+		log.Printf("[%s] Phòng đã rỗng và được giải phóng khỏi RAM (Zero Memory Leak)\n", roomID)
 	}
 	room.Lock.Unlock()
 }
@@ -116,6 +149,23 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 			_ = room.Sender.WriteMessage(websocket.TextMessage, []byte(`{"type":"PEER_CONNECTED","role":"receiver"}`))
 			_ = room.Receiver.WriteMessage(websocket.TextMessage, []byte(`{"type":"PEER_CONNECTED","role":"sender"}`))
 		}
+
+		// Khởi chạy goroutine chuyên trách đọc từ Queue (tối đa 10 chunk) và gửi ra Receiver
+		go func(rcvConn *websocket.Conn, q chan RelayMessage, stop chan struct{}) {
+			for {
+				select {
+				case msg, ok := <-q:
+					if !ok {
+						return
+					}
+					if err := rcvConn.WriteMessage(msg.MsgType, msg.Data); err != nil {
+						return
+					}
+				case <-stop:
+					return
+				}
+			}
+		}(conn, room.Queue, room.StopChan)
 	}
 	room.Lock.Unlock()
 
@@ -133,19 +183,26 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Forward dữ liệu: Sender -> Receiver hoặc ACK từ Receiver -> Sender
-		room.Lock.Lock()
-		var target *websocket.Conn
 		if role == "sender" {
-			target = room.Receiver
+			// BÊN GỬI -> BÊN NHẬN:
+			// Đưa vào Channel Queue (có sức chứa tối đa đúng 10 chunk).
+			// Nếu trong RAM đã có 10 chunk chưa kịp gửi tới Receiver, dòng này sẽ TỰ ĐỘNG CHỜ (BLOCK),
+			// ép socket TCP của bên gửi dừng đọc -> TCP Flow Control ép trình duyệt bên gửi hãm tốc độ lại.
+			select {
+			case room.Queue <- RelayMessage{MsgType: msgType, Data: data}:
+			case <-room.StopChan:
+				return
+			}
 		} else {
-			target = room.Sender
+			// BÊN NHẬN -> BÊN GỬI (Tín hiệu ACK phản hồi flow control):
+			// Tín hiệu ACK cực nhẹ (< 10 bytes) được chuyển thẳng trực tiếp về Sender, không qua queue 10 chunk
+			room.Lock.Lock()
+			sender := room.Sender
+			room.Lock.Unlock()
+			if sender != nil {
+				_ = sender.WriteMessage(msgType, data)
+			}
 		}
-
-		if target != nil {
-			_ = target.WriteMessage(msgType, data)
-		}
-		room.Lock.Unlock()
 	}
 }
 
@@ -166,7 +223,7 @@ func main() {
 	fs := http.FileServer(http.Dir("./public"))
 	http.Handle("/", fs)
 
-	log.Printf("v6drop Go Relay Server đang chạy tại cổng %s\n", port)
+	log.Printf("v6drop Go Relay Server đang chạy tại cổng %s (Buffer RAM: tối đa %d chunks)\n", port, MaxChunksInRam)
 	server := &http.Server{
 		Addr:         "0.0.0.0:" + port,
 		ReadTimeout:  120 * time.Second,
