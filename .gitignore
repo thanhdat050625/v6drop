@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+*.pdb
+
+# Environment variables (KHÔNG commit file chứa secret lên repo public)
+.env
+.env.local
+.env.*.local
+
+# IDE & Editor configs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
