@@ -152,7 +152,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"
+		port = "10000"
 	}
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -168,7 +168,7 @@ func main() {
 
 	log.Printf("v6drop Go Relay Server đang chạy tại cổng %s\n", port)
 	server := &http.Server{
-		Addr:         ":" + port,
+		Addr:         "0.0.0.0:" + port,
 		ReadTimeout:  120 * time.Second,
 		WriteTimeout: 120 * time.Second,
 	}
