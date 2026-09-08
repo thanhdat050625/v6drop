@@ -9,13 +9,13 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Giới hạn tối đa đúng 5 chunk trong RAM (5 * 64KB = 320KB RAM)
+// Giới hạn tối đa đúng 5 chunk trong RAM (5 * 256KB = 1.28MB RAM)
 // Cho phép truyền gối đầu (pipelining) để bên nhận tải về liên tục không bị khựng
 const MaxChunksInRam = 5
 
 var upgrader = websocket.Upgrader{
-	ReadBufferSize:  64 * 1024,
-	WriteBufferSize: 64 * 1024,
+	ReadBufferSize:  256 * 1024,
+	WriteBufferSize: 256 * 1024,
 	CheckOrigin: func(r *http.Request) bool {
 		return true
 	},
