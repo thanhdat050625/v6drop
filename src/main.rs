@@ -54,8 +54,10 @@ async fn main() {
     // Nạp cấu hình từ .env nếu tồn tại
     dotenvy::dotenv().ok();
 
-    // Khởi tạo logger siêu nhẹ qua tracing
+    // Khởi tạo logger siêu nhẹ qua tracing (tắt in giờ vì Render đã tự động thêm timestamp)
     tracing_subscriber::fmt()
+        .without_time()
+        .with_target(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "v6drop=info,tower_http=info".into()),
@@ -181,7 +183,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, params: WsParams) {
     }
 
     // Task gửi dữ liệu từ channel mpsc ra socket của client
-    let mut write_task = tokio::spawn(async move {
+    let write_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if ws_sender.send(msg).await.is_err() {
                 break;
@@ -191,7 +193,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, params: WsParams) {
 
     // Heartbeat nhẹ định kỳ mỗi 25 giây để chống timeout / giữ kết nối trên Render
     let heartbeat_tx = tx.clone();
-    let mut heartbeat_task = tokio::spawn(async move {
+    let heartbeat_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(25));
         loop {
             interval.tick().await;
