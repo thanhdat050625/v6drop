@@ -176,20 +176,21 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 					if !ok {
 						return
 					}
-					if err := rcvConn.WriteMessage(msg.MsgType, msg.Data); err != nil {
-						return
-					}
-					// Nếu đây là chunk dữ liệu nhị phân:
-					// Ngay khi Server lấy 1 chunk ra khỏi RAM và đẩy cho Receiver thành công,
-					// trong RAM server vừa hụt 1 chunk (< MaxChunksInRam).
-					// Server báo ngay ACK cho Bên Gửi để Bên Gửi bơm ngay 1 chunk tiếp theo bù vào!
+					// Ngay khi Server lấy 1 chunk ra khỏi RAM -> hàng đợi vừa trống 1 slot (< MaxChunksInRam)!
+					// Gửi ngay ACK cho Sender trong goroutine chạy song song để Sender bơm tiếp chunk mới bù vào,
+					// trong lúc goroutine này đang truyền chunk dữ liệu cho Receiver (True Parallel Pipeline!)
 					if msg.MsgType == websocket.BinaryMessage {
 						rm.Lock.Lock()
 						snd := rm.Sender
 						rm.Lock.Unlock()
 						if snd != nil {
-							_ = snd.WriteMessage(websocket.TextMessage, []byte("ACK"))
+							go func(s *SafeConn) {
+								_ = s.WriteMessage(websocket.TextMessage, []byte("ACK"))
+							}(snd)
 						}
+					}
+					if err := rcvConn.WriteMessage(msg.MsgType, msg.Data); err != nil {
+						return
 					}
 				case <-stop:
 					return
@@ -251,6 +252,12 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
+	})
+
+	http.HandleFunc("/speedtest", func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 2*1024*1024) // 2MB
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(buf)
 	})
 
 	http.HandleFunc("/ws", handleWS)
