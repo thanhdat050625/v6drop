@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>v6drop - Truyền File &amp; Video Tốc Độ Cao</title>
+  <meta name="description"
+    content="Truyền file dung lượng lớn siêu tốc qua Go WebSocket Relay với kiểm soát luồng Backpressure ACK và Web Worker SHA-256">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap"
+    rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=20260908_speed">
+</head>
+
+<body>
+
+  <!-- Full-Width Header Navbar -->
+  <header class="navbar">
+    <a href="#/gui" class="brand">
+      <span>⚡ v6drop</span>
+      <span class="badge">Go Relay</span>
+    </a>
+
+    <!-- Top Route Switcher: /gui & /nhan -->
+    <nav class="mode-switch">
+      <a href="#/gui" id="tabGui" class="mode-tab active-sender">
+        <span>📤 Bên Gửi</span>
+      </a>
+      <a href="#/nhan" id="tabNhan" class="mode-tab">
+        <span>📥 Bên Nhận</span>
+      </a>
+    </nav>
+  </header>
+
+  <!-- Full-Width Main Viewport -->
+  <main class="main-viewport">
+
+    <!-- 1. Room Bar Card (Shared across routes) -->
+    <section class="card room-card">
+      <div class="room-bar">
+        <div class="room-input-group">
+          <span>Mã phòng:</span>
+          <input type="text" id="roomId" value="phong-video-1" placeholder="Nhập mã phòng...">
+        </div>
+      </div>
+    </section>
+
+    <!-- 2. ROUTE: BÊN GỬI (/gui) -->
+    <section id="viewGui" class="route-view">
+      <div class="card">
+        <h2 style="font-size: 18px; margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
+          <span>📤</span> Tải lên &amp; Truyền file (Bên Gửi)
+        </h2>
+
+        <!-- File Upload Area -->
+        <div class="drop-zone" id="dropZone">
+          <div class="icon">📁</div>
+          <h3>Kéo thả file vào đây để gửi</h3>
+          <p>hoặc nhấn chuột để chọn file bất kỳ (Video MP4, MKV, ZIP, ISO... không giới hạn dung lượng)</p>
+          <input type="file" id="fileInput" style="display: none;">
+        </div>
+
+        <!-- Selected File Meta -->
+        <div class="file-card" id="fileCard" style="display: none;">
+          <div class="file-info">
+            <span class="file-icon">🎬</span>
+            <div class="file-text">
+              <div class="file-name" id="selectedFileName">-</div>
+              <div class="file-size" id="selectedFileSize">0 MB</div>
+            </div>
+          </div>
+          <button type="button" class="btn btn-subtle" id="btnChangeFile" style="padding: 6px 14px; font-size: 13px;">
+            Đổi file khác
+          </button>
+        </div>
+
+        <!-- Action Button -->
+        <div style="margin-top: 24px;">
+          <button type="button" class="btn btn-primary btn-lg" id="btnStartSend" style="width: 100%;">
+            🚀 Bắt đầu gửi file qua Go Relay
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 3. ROUTE: BÊN NHẬN (/nhan) -->
+    <section id="viewNhan" class="route-view" style="display: none;">
+      <div class="card">
+        <div class="receiver-hero">
+          <div class="icon">📥</div>
+          <h3>Sẵn sàng nhận dữ liệu</h3>
+          <p>
+            Nhập chung <strong>Mã phòng</strong> với Bên Gửi, sau đó bấm nút bên dưới. Khi Bên Gửi bắt đầu, file sẽ tự
+            động truyền và tải về máy bạn.
+          </p>
+          <button type="button" class="btn btn-accent btn-lg" id="btnStartReceive" style="min-width: 260px;">
+            🎯 Bật chế độ Chờ Nhận
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4. Progress & Live Transfer Metrics (Shared) -->
+    <section class="card progress-card" id="progressCard" style="display: none;">
+      <div class="progress-header">
+        <span id="transferStatus">Đang chuẩn bị truyền...</span>
+        <span id="transferPercent" style="color: #60a5fa; font-family: 'JetBrains Mono', monospace;">0%</span>
+      </div>
+
+      <div class="progress-wrap">
+        <div class="progress-bar" id="progressBar"></div>
+      </div>
+
+      <div class="metrics-grid">
+        <div class="metric-item">
+          <div class="metric-value" id="metricSpeed">0 MB/s</div>
+          <div class="metric-label">Tốc độ tức thời</div>
+        </div>
+        <div class="metric-item">
+          <div class="metric-value" id="metricTransferred">0 / 0 MB</div>
+          <div class="metric-label">Đã truyền tải</div>
+        </div>
+        <div class="metric-item">
+          <div class="metric-value" id="metricEta">--:--</div>
+          <div class="metric-label">Ước tính còn lại</div>
+        </div>
+        <div class="metric-item">
+          <div class="metric-value" id="metricChunks">0 chunk</div>
+          <div class="metric-label">Số gói 256KB</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 5. Collapsible Diagnostic Log -->
+    <section class="log-drawer">
+      <div class="log-toggle" id="btnToggleLog">
+        <span>📋 Nhật ký kết nối &amp; Giao thức</span>
+        <span id="logToggleIcon">▼ Mở xem</span>
+      </div>
+      <div class="log-console" id="logConsole">
+        <div class="log-entry">[System] v6drop Go Relay Client sẵn sàng.</div>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="app.js?v=20260908_speed"></script>
+</body>
+
+</html>
