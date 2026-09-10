@@ -1,10 +1,9 @@
 /**
  * v6drop - High-Performance File & Video Transfer
- * Go WebSocket Relay + Pipelined Sliding Window (5 chunks x 256KB gối đầu) + Checksum Verification
+ * Go WebSocket Relay + Continuous Streaming with Native Backpressure (ws.bufferedAmount) + Checksum Verification
  */
 
 const CHUNK_SIZE = 256 * 1024;     // 256KB chunk
-const MAX_CHUNKS_IN_RAM = 8;       // Luôn giữ tối đa 8 chunk trong RAM server (2.0MB RAM)
 const SERVER_WS_BASE = 'wss://v6drop-nganhang5742.onrender.com/ws';
 
 let ws = null;
@@ -273,8 +272,6 @@ function uploadFilePipelined(file, checksum) {
   ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
 
-  let inFlight = 0;
-  let ackedCount = 0;
   let sentChunks = 0;
   let startTime = 0;
   let lastSpeedTime = 0;
@@ -282,40 +279,80 @@ function uploadFilePipelined(file, checksum) {
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
   let isTransferring = true;
 
-  async function sendOneChunk(chunkIndex) {
-    if (!isTransferring || ws.readyState !== WebSocket.OPEN) return;
-    const currentOffset = chunkIndex * CHUNK_SIZE;
-    const sliceSize = Math.min(CHUNK_SIZE, file.size - currentOffset);
-    const slice = file.slice(currentOffset, currentOffset + sliceSize);
+  // Giới hạn buffer tạm trong máy gửi là 4MB (bơm liên tục không cần chờ ACK)
+  const MAX_BUFFERED_AMOUNT = 4 * 1024 * 1024;
 
-    try {
-      // Đọc lát cắt siêu tốc bằng native C++ (0.1ms)
-      const buf = await readBlobAsArrayBuffer(slice);
-      if (!isTransferring || ws.readyState !== WebSocket.OPEN) return;
+  async function startStreaming() {
+    startTime = performance.now();
+    lastSpeedTime = startTime;
+    lastSpeedBytes = 0;
 
-      // Tiền tố 4 byte Uint32 Big-Endian chỉ số chunkIndex (0, 1, 2...)
-      const packet = new Uint8Array(4 + buf.byteLength);
-      const dv = new DataView(packet.buffer);
-      dv.setUint32(0, chunkIndex, false);
-      packet.set(new Uint8Array(buf), 4);
-      ws.send(packet.buffer);
-    } catch (err) {
-      log(`Lỗi đọc chunk ${chunkIndex}: ${err.message}`);
-      UI.transferStatus.textContent = 'Lỗi đọc file: ' + err.message;
-      UI.btnStartSend.disabled = false;
-      isTransferring = false;
-      releaseWakeLock();
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+      if (!isTransferring || ws.readyState !== WebSocket.OPEN) break;
+
+      // Native Backpressure: Nếu buffer socket của trình duyệt > 4MB thì chờ card mạng xả bớt
+      while (ws.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+        await new Promise(r => setTimeout(r, 5));
+        if (!isTransferring || ws.readyState !== WebSocket.OPEN) break;
+      }
+      if (!isTransferring || ws.readyState !== WebSocket.OPEN) break;
+
+      const currentOffset = chunkIndex * CHUNK_SIZE;
+      const sliceSize = Math.min(CHUNK_SIZE, file.size - currentOffset);
+      const slice = file.slice(currentOffset, currentOffset + sliceSize);
+
+      try {
+        const buf = await readBlobAsArrayBuffer(slice);
+        if (!isTransferring || ws.readyState !== WebSocket.OPEN) break;
+
+        const packet = new Uint8Array(4 + buf.byteLength);
+        const dv = new DataView(packet.buffer);
+        dv.setUint32(0, chunkIndex, false);
+        packet.set(new Uint8Array(buf), 4);
+
+        ws.send(packet.buffer);
+        sentChunks++;
+
+        // Cập nhật thanh tiến trình theo lượng đã gửi thực tế
+        const transferredBytes = Math.min(file.size, (chunkIndex + 1) * CHUNK_SIZE);
+        const progress = Math.min(100, (transferredBytes / file.size) * 100);
+
+        UI.progressBar.style.width = `${progress}%`;
+        UI.transferPercent.textContent = `${progress.toFixed(1)}%`;
+        UI.transferStatus.textContent = `Đang truyền: ${file.name}`;
+        UI.metricTransferred.textContent = `${formatBytes(transferredBytes)} / ${formatBytes(file.size)}`;
+        UI.metricChunks.textContent = `${sentChunks} / ${totalChunks}`;
+
+        const now = performance.now();
+        if (now - lastSpeedTime >= 300) {
+          const bytesSec = (transferredBytes - lastSpeedBytes) / ((now - lastSpeedTime) / 1000);
+          const mbSec = bytesSec / (1024 * 1024);
+          UI.metricSpeed.textContent = `${mbSec.toFixed(2)} MB/s`;
+
+          if (bytesSec > 0) {
+            const secLeft = (file.size - transferredBytes) / bytesSec;
+            const m = Math.floor(secLeft / 60);
+            const s = Math.floor(secLeft % 60);
+            UI.metricEta.textContent = `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+          }
+          lastSpeedTime = now;
+          lastSpeedBytes = transferredBytes;
+        }
+      } catch (err) {
+        log(`Lỗi đọc chunk ${chunkIndex}: ${err.message}`);
+        UI.transferStatus.textContent = 'Lỗi đọc file: ' + err.message;
+        UI.btnStartSend.disabled = false;
+        isTransferring = false;
+        releaseWakeLock();
+        break;
+      }
     }
-  }
 
-  // Giữ cho hàng đợi trên Server luôn có tối đa MAX_CHUNKS_IN_RAM chunk (2.0MB RAM)
-  // Nếu trên server hụt < MAX_CHUNKS_IN_RAM thì hàm này bơm bù ngay lập tức!
-  function fillServerQueue() {
-    if (!isTransferring || ws.readyState !== WebSocket.OPEN) return;
-    while (inFlight < MAX_CHUNKS_IN_RAM && sentChunks < totalChunks) {
-      const idx = sentChunks++;
-      inFlight++;
-      sendOneChunk(idx);
+    if (sentChunks >= totalChunks && isTransferring) {
+      UI.progressBar.style.width = '100%';
+      UI.transferPercent.textContent = '100%';
+      UI.transferStatus.textContent = 'Đã gửi đủ 100% dữ liệu. Đang đợi Bên Nhận đối soát Checksum SHA-256...';
+      log('Đã gửi đủ 100% dữ liệu vào đường truyền. Chờ Bên Nhận xác thực mã băm...');
     }
   }
 
@@ -338,56 +375,9 @@ function uploadFilePipelined(file, checksum) {
       if (e.data === '{"type":"pong"}') return;
 
       if (e.data === 'READY') {
-        // Bên Nhận đã sẵn sàng -> Bên Gửi lập tức bơm đầy MAX_CHUNKS_IN_RAM (8 chunk) vào server
-        log(`Bên Nhận đã sẵn sàng! Bắt đầu bơm ${Math.min(totalChunks, MAX_CHUNKS_IN_RAM)} chunk đầu tiên vào RAM server...`);
+        log(`Bên Nhận đã sẵn sàng! Bắt đầu truyền dữ liệu siêu tốc liên tục...`);
         UI.transferStatus.textContent = `Đang truyền: ${file.name}`;
-        startTime = performance.now();
-        lastSpeedTime = startTime;
-        lastSpeedBytes = 0;
-        fillServerQueue();
-        return;
-      }
-
-      if (e.data === 'ACK') {
-        // Server vừa lấy 1 chunk ra gửi cho Receiver -> Server RAM vừa hụt 1 chunk (< MAX_CHUNKS_IN_RAM)
-        inFlight = Math.max(0, inFlight - 1);
-        ackedCount++;
-
-        const transferredBytes = Math.min(file.size, ackedCount * CHUNK_SIZE);
-        const progress = Math.min(100, (transferredBytes / file.size) * 100);
-
-        UI.progressBar.style.width = `${progress}%`;
-        UI.transferPercent.textContent = `${progress.toFixed(1)}%`;
-        UI.transferStatus.textContent = `Đang truyền: ${file.name}`;
-        UI.metricTransferred.textContent = `${formatBytes(transferredBytes)} / ${formatBytes(file.size)}`;
-        UI.metricChunks.textContent = `${ackedCount} / ${totalChunks}`;
-
-        const now = performance.now();
-        if (now - lastSpeedTime >= 300) {
-          const bytesSec = (transferredBytes - lastSpeedBytes) / ((now - lastSpeedTime) / 1000);
-          const mbSec = bytesSec / (1024 * 1024);
-          UI.metricSpeed.textContent = `${mbSec.toFixed(2)} MB/s`;
-
-          if (bytesSec > 0) {
-            const secLeft = (file.size - transferredBytes) / bytesSec;
-            const m = Math.floor(secLeft / 60);
-            const s = Math.floor(secLeft % 60);
-            UI.metricEta.textContent = `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-          }
-          lastSpeedTime = now;
-          lastSpeedBytes = transferredBytes;
-        }
-
-        if (ackedCount >= totalChunks) {
-          isTransferring = false;
-          UI.progressBar.style.width = '100%';
-          UI.transferPercent.textContent = '100%';
-          UI.transferStatus.textContent = 'Đã gửi đủ 100% dữ liệu. Đang đợi Bên Nhận đối soát Checksum SHA-256...';
-          log('Đã gửi đủ 100% dữ liệu. Chờ Bên Nhận xác thực mã băm...');
-        } else {
-          // Server vừa hụt 1 chunk -> bơm bù ngay 1 chunk tiếp theo tức thì!
-          fillServerQueue();
-        }
+        startStreaming();
         return;
       }
 
@@ -408,7 +398,6 @@ function uploadFilePipelined(file, checksum) {
           UI.transferStatus.textContent = 'Bên Nhận vừa ngắt kết nối.';
           releaseWakeLock();
         } else if (parsed.type === 'VERIFY_OK') {
-          // Bên Nhận đã đối soát Checksum thành công!
           const totalSec = Math.max(0.1, (performance.now() - startTime) / 1000);
           const avgSpeed = (file.size / (1024 * 1024)) / totalSec;
           UI.transferStatus.textContent = `🎉 Checksum KHỚP 100%! Hoàn tất trong ${totalSec.toFixed(1)}s (${avgSpeed.toFixed(2)} MB/s).`;
@@ -465,7 +454,6 @@ if (UI.btnStartReceive) {
     let startTime = 0;
     let lastSpeedTime = 0;
     let lastSpeedBytes = 0;
-    let receiveQueue = Promise.resolve();
 
     ws.onopen = () => {
       log('Bên Nhận đã vào phòng. Chờ Bên Gửi gửi Metadata & Checksum...');
@@ -473,7 +461,7 @@ if (UI.btnStartReceive) {
       startKeepAlive();
     };
 
-    ws.onmessage = (e) => {
+    ws.onmessage = async (e) => {
       // Nhận Metadata hoặc Ping/Pong
       if (typeof e.data === 'string') {
         if (e.data === '{"type":"pong"}') return;
@@ -488,7 +476,6 @@ if (UI.btnStartReceive) {
             startTime = 0; // Chưa bấm giờ vội! Chờ chunk đầu tiên cập bến mới bấm giờ chính xác!
             lastSpeedTime = 0;
             lastSpeedBytes = 0;
-            receiveQueue = Promise.resolve();
 
             requestWakeLock();
             log(`Bắt đầu nhận file: ${meta.name} (${formatBytes(meta.size)}) | Checksum gửi: ${meta.checksum.slice(0, 16)}...`);
@@ -501,97 +488,80 @@ if (UI.btnStartReceive) {
         return;
       }
 
-      // Xử lý Binary Chunk theo hàng đợi tuần tự nghiêm ngặt (FIFO Chain)
-      receiveQueue = receiveQueue.then(async () => {
-        let buffer = e.data;
-        if (buffer instanceof Blob) {
-          buffer = await buffer.arrayBuffer();
+      // Xử lý Binary Chunk trực tiếp (Zero-copy, đồng bộ, không nghẽn Promise chain)
+      let buffer = e.data;
+      if (buffer instanceof Blob) {
+        buffer = await buffer.arrayBuffer();
+      }
+
+      if (buffer instanceof ArrayBuffer) {
+        if (buffer.byteLength < 4) return;
+
+        // Bắt đầu bấm giờ KHI VỪA NHẬN CHUNK ĐẦU TIÊN (loại bỏ thời gian chờ handshake và đổi tab)
+        if (startTime === 0) {
+          startTime = performance.now();
+          lastSpeedTime = startTime;
+          lastSpeedBytes = 0;
+          UI.transferStatus.textContent = `Đang nhận: ${meta.name}`;
         }
 
-        if (buffer instanceof ArrayBuffer) {
-          if (buffer.byteLength < 4) return;
+        const dv = new DataView(buffer);
+        const chunkIndex = dv.getUint32(0, false);
 
-          // Bắt đầu bấm giờ KHI VỪA NHẬN CHUNK ĐẦU TIÊN (loại bỏ thời gian chờ handshake và đổi tab)
-          if (startTime === 0) {
-            startTime = performance.now();
-            lastSpeedTime = startTime;
-            lastSpeedBytes = 0;
-            UI.transferStatus.textContent = `Đang nhận: ${meta.name}`;
+        // Zero-copy: Tạo TypedArray view trực tiếp từ byte thứ 4 mà không copy bộ nhớ
+        const chunkData = new Uint8Array(buffer, 4);
+
+        // Gán chunk đúng vị trí chunkIndex tuyệt đối -> không bao giờ bị xáo trộn thứ tự
+        chunks[chunkIndex] = chunkData;
+        receivedBytes += chunkData.byteLength;
+        chunkCount++;
+
+        const now = performance.now();
+        const progress = Math.min(100, (receivedBytes / meta.size) * 100);
+
+        UI.progressBar.style.width = `${progress}%`;
+        UI.transferPercent.textContent = `${progress.toFixed(1)}%`;
+        UI.metricTransferred.textContent = `${formatBytes(receivedBytes)} / ${formatBytes(meta.size)}`;
+        UI.metricChunks.textContent = `${chunkCount} / ${meta.totalChunks || '?'}`;
+
+        if (now - lastSpeedTime >= 300) {
+          const bytesSec = (receivedBytes - lastSpeedBytes) / ((now - lastSpeedTime) / 1000);
+          const mbSec = bytesSec / (1024 * 1024);
+          UI.metricSpeed.textContent = `${mbSec.toFixed(2)} MB/s`;
+
+          if (bytesSec > 0) {
+            const secLeft = (meta.size - receivedBytes) / bytesSec;
+            const m = Math.floor(secLeft / 60);
+            const s = Math.floor(secLeft % 60);
+            UI.metricEta.textContent = `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
           }
+          lastSpeedTime = now;
+          lastSpeedBytes = receivedBytes;
+        }
 
-          const dv = new DataView(buffer);
-          const chunkIndex = dv.getUint32(0, false);
+        // Khi nhận đủ 100% dữ liệu -> Bắt đầu đối soát Checksum SHA-256
+        if (receivedBytes >= meta.size) {
+          const totalSec = Math.max(0.1, (performance.now() - startTime) / 1000);
+          const avgSpeed = (meta.size / (1024 * 1024)) / totalSec;
+          UI.transferStatus.textContent = 'Đang đối soát mã Checksum SHA-256...';
+          log(`Đã nhận đủ 100% dữ liệu trong ${totalSec.toFixed(1)}s (Tốc độ TB: ${avgSpeed.toFixed(2)} MB/s). Bắt đầu đối soát mã Checksum...`);
 
-          // Zero-copy: Tạo TypedArray view trực tiếp từ byte thứ 4 mà không copy bộ nhớ (0ms latency, 0 byte RAM dư)
-          const chunkData = new Uint8Array(buffer, 4);
+          const fullBlob = new Blob(chunks);
+          chunks = []; // giải phóng mảng chunks
 
-          // Gán chunk đúng vị trí chunkIndex tuyệt đối -> không bao giờ bị xáo trộn thứ tự
-          chunks[chunkIndex] = chunkData;
-          receivedBytes += chunkData.byteLength;
-          chunkCount++;
+          try {
+            const receiverChecksum = await computeChecksum(fullBlob);
+            log(`Mã Checksum Bên Nhận tính được: ${receiverChecksum.slice(0, 16)}...`);
 
-          const now = performance.now();
-          const progress = Math.min(100, (receivedBytes / meta.size) * 100);
+            if (receiverChecksum === meta.checksum) {
+              // Khớp mã hoàn toàn!
+              log(`✅ Khớp mã Checksum SHA-256 hoàn hảo! File nguyên vẹn 100%.`);
+              UI.transferStatus.textContent = `🎉 Checksum KHỚP 100%! Đã tải ${meta.name} về máy (${avgSpeed.toFixed(2)} MB/s)`;
 
-          UI.progressBar.style.width = `${progress}%`;
-          UI.transferPercent.textContent = `${progress.toFixed(1)}%`;
-          UI.metricTransferred.textContent = `${formatBytes(receivedBytes)} / ${formatBytes(meta.size)}`;
-          UI.metricChunks.textContent = `${chunkCount} / ${meta.totalChunks || '?'}`;
+              // Báo lại cho Bên Gửi biết là đối soát thành công
+              ws.send(JSON.stringify({ type: 'VERIFY_OK', checksum: receiverChecksum, avgSpeed: avgSpeed.toFixed(2) }));
 
-          if (now - lastSpeedTime >= 300) {
-            const bytesSec = (receivedBytes - lastSpeedBytes) / ((now - lastSpeedTime) / 1000);
-            const mbSec = bytesSec / (1024 * 1024);
-            UI.metricSpeed.textContent = `${mbSec.toFixed(2)} MB/s`;
-
-            if (bytesSec > 0) {
-              const secLeft = (meta.size - receivedBytes) / bytesSec;
-              const m = Math.floor(secLeft / 60);
-              const s = Math.floor(secLeft % 60);
-              UI.metricEta.textContent = `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
-            }
-            lastSpeedTime = now;
-            lastSpeedBytes = receivedBytes;
-          }
-
-          // Khi nhận đủ 100% dữ liệu -> Bắt đầu đối soát Checksum SHA-256
-          if (receivedBytes >= meta.size) {
-            const totalSec = Math.max(0.1, (performance.now() - startTime) / 1000);
-            const avgSpeed = (meta.size / (1024 * 1024)) / totalSec;
-            UI.transferStatus.textContent = 'Đang đối soát mã Checksum SHA-256...';
-            log(`Đã nhận đủ 100% dữ liệu trong ${totalSec.toFixed(1)}s (Tốc độ TB: ${avgSpeed.toFixed(2)} MB/s). Bắt đầu đối soát mã Checksum...`);
-
-            const fullBlob = new Blob(chunks);
-            chunks = []; // giải phóng mảng chunks
-
-            try {
-              const receiverChecksum = await computeChecksum(fullBlob);
-              log(`Mã Checksum Bên Nhận tính được: ${receiverChecksum.slice(0, 16)}...`);
-
-              if (receiverChecksum === meta.checksum) {
-                // Khớp mã hoàn toàn!
-                log(`✅ Khớp mã Checksum SHA-256 hoàn hảo! File nguyên vẹn 100%.`);
-                UI.transferStatus.textContent = `🎉 Checksum KHỚP 100%! Đã tải ${meta.name} về máy (${avgSpeed.toFixed(2)} MB/s)`;
-
-                // Báo lại cho Bên Gửi biết là đối soát thành công
-                ws.send(JSON.stringify({ type: 'VERIFY_OK', checksum: receiverChecksum, avgSpeed: avgSpeed.toFixed(2) }));
-
-                // Kích hoạt tải file về máy
-                const downloadUrl = URL.createObjectURL(fullBlob);
-                const a = document.createElement('a');
-                a.href = downloadUrl;
-                a.download = meta.name;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-              } else {
-                // Không khớp mã!
-                log(`❌ Lỗi: Mã Checksum không khớp! (Gửi: ${meta.checksum} != Nhận: ${receiverChecksum})`);
-                UI.transferStatus.textContent = `⚠️ Cảnh báo: Mã Checksum không khớp! File có thể bị lỗi khi truyền.`;
-                ws.send(JSON.stringify({ type: 'VERIFY_FAIL' }));
-              }
-            } catch (err) {
-              log(`Lỗi khi tính checksum bên nhận: ${err.message}`);
-              ws.send(JSON.stringify({ type: 'VERIFY_OK' }));
+              // Kích hoạt tải file về máy
               const downloadUrl = URL.createObjectURL(fullBlob);
               const a = document.createElement('a');
               a.href = downloadUrl;
@@ -599,16 +569,31 @@ if (UI.btnStartReceive) {
               document.body.appendChild(a);
               a.click();
               document.body.removeChild(a);
+            } else {
+              // Không khớp mã!
+              log(`❌ Lỗi: Mã Checksum không khớp! (Gửi: ${meta.checksum} != Nhận: ${receiverChecksum})`);
+              UI.transferStatus.textContent = `⚠️ Cảnh báo: Mã Checksum không khớp! File có thể bị lỗi khi truyền.`;
+              ws.send(JSON.stringify({ type: 'VERIFY_FAIL' }));
             }
-
-            UI.progressBar.style.width = '100%';
-            UI.transferPercent.textContent = '100%';
-            UI.btnStartReceive.disabled = false;
-            releaseWakeLock();
-            stopKeepAlive();
+          } catch (err) {
+            log(`Lỗi khi tính checksum bên nhận: ${err.message}`);
+            ws.send(JSON.stringify({ type: 'VERIFY_OK' }));
+            const downloadUrl = URL.createObjectURL(fullBlob);
+            const a = document.createElement('a');
+            a.href = downloadUrl;
+            a.download = meta.name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
           }
+
+          UI.progressBar.style.width = '100%';
+          UI.transferPercent.textContent = '100%';
+          UI.btnStartReceive.disabled = false;
+          releaseWakeLock();
+          stopKeepAlive();
         }
-      });
+      }
     };
 
     ws.onerror = () => {

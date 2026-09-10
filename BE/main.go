@@ -9,10 +9,9 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Giới hạn tối đa 8 chunk trong RAM (8 * 256KB = 2.0MB RAM)
-// Cho phép truyền gối đầu (pipelining): Server luôn duy trì tối đa 8 chunk,
-// cứ thiếu 1 chunk là server báo ACK để bên gửi bơm bù ngay lập tức!
-const MaxChunksInRam = 8
+// Giới hạn tối đa 32 chunk trong RAM (32 * 256KB = 8.0MB RAM)
+// Cho phép truyền streaming liên tục (continuous pipelining), tận dụng tối đa băng thông TCP
+const MaxChunksInRam = 32
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024 * 1024,
@@ -168,26 +167,13 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		rcvStop := make(chan struct{})
 		defer close(rcvStop)
 
-		// Goroutine chuyên trách đọc từ Queue (tối đa 8 chunk) và gửi ra Receiver liên tục
-		go func(rcvConn *SafeConn, q chan RelayMessage, stop chan struct{}, rm *Room) {
+		// Goroutine chuyên trách đọc từ Queue (tối đa 32 chunk) và gửi ra Receiver liên tục
+		go func(rcvConn *SafeConn, q chan RelayMessage, stop chan struct{}) {
 			for {
 				select {
 				case msg, ok := <-q:
 					if !ok {
 						return
-					}
-					// Ngay khi Server lấy 1 chunk ra khỏi RAM -> hàng đợi vừa trống 1 slot (< MaxChunksInRam)!
-					// Gửi ngay ACK cho Sender trong goroutine chạy song song để Sender bơm tiếp chunk mới bù vào,
-					// trong lúc goroutine này đang truyền chunk dữ liệu cho Receiver (True Parallel Pipeline!)
-					if msg.MsgType == websocket.BinaryMessage {
-						rm.Lock.Lock()
-						snd := rm.Sender
-						rm.Lock.Unlock()
-						if snd != nil {
-							go func(s *SafeConn) {
-								_ = s.WriteMessage(websocket.TextMessage, []byte("ACK"))
-							}(snd)
-						}
 					}
 					if err := rcvConn.WriteMessage(msg.MsgType, msg.Data); err != nil {
 						return
@@ -196,7 +182,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
-		}(sConn, room.Queue, rcvStop, room)
+		}(sConn, room.Queue, rcvStop)
 	}
 	room.Lock.Unlock()
 
@@ -225,8 +211,8 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 					_ = rcv.WriteMessage(msgType, data)
 				}
 			} else {
-				// Binary chunk dữ liệu -> Đưa vào Queue (tối đa MaxChunksInRam = 8)
-				// Nếu trong RAM đã có đủ 8 chunk, dòng này tự động BLOCK (Backpressure tự nhiên của TCP)
+				// Binary chunk dữ liệu -> Đưa vào Queue (tối đa MaxChunksInRam = 32)
+				// Nếu trong RAM đã có đủ 32 chunk, dòng này tự động BLOCK (Backpressure tự nhiên của TCP)
 				room.Queue <- RelayMessage{MsgType: msgType, Data: data}
 			}
 		} else {
