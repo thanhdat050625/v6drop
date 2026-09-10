@@ -455,6 +455,22 @@ if (UI.btnStartReceive) {
     let lastSpeedTime = 0;
     let lastSpeedBytes = 0;
 
+    let opfsFileHandle = null;
+    let opfsWritable = null;
+    let useOpfs = false;
+    let opfsWriteQueue = Promise.resolve();
+
+    const cleanupOpfs = async () => {
+      if (opfsWritable) {
+        try { await opfsWritable.abort(); } catch (_) {}
+        opfsWritable = null;
+      }
+      if (opfsFileHandle) {
+        try { await opfsFileHandle.remove(); } catch (_) {}
+        opfsFileHandle = null;
+      }
+    };
+
     ws.onopen = () => {
       log('Bên Nhận đã vào phòng. Chờ Bên Gửi gửi Metadata & Checksum...');
       UI.transferStatus.textContent = 'Đã kết nối phòng! Đang đợi Bên Gửi bấm gửi...';
@@ -471,16 +487,40 @@ if (UI.btnStartReceive) {
           if (parsed.name && parsed.size) {
             meta = parsed;
             receivedBytes = 0;
-            chunks = new Array(meta.totalChunks || 0);
             chunkCount = 0;
-            startTime = 0; // Chưa bấm giờ vội! Chờ chunk đầu tiên cập bến mới bấm giờ chính xác!
+            startTime = 0; // Bấm giờ khi nhận chunk 0
             lastSpeedTime = 0;
             lastSpeedBytes = 0;
+            chunks = [];
+            useOpfs = false;
+            opfsWriteQueue = Promise.resolve();
+
+            // Khởi tạo OPFS Direct Disk Streaming nếu trình duyệt hỗ trợ
+            if (navigator.storage && typeof navigator.storage.getDirectory === 'function') {
+              try {
+                const root = await navigator.storage.getDirectory();
+                const safeName = meta.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+                const tempName = `v6drop_${Date.now()}_${safeName}`;
+                opfsFileHandle = await root.getFileHandle(tempName, { create: true });
+                if (typeof opfsFileHandle.createWritable === 'function') {
+                  opfsWritable = await opfsFileHandle.createWritable({ keepExistingData: true });
+                  useOpfs = true;
+                  log('⚡ Kích hoạt OPFS Direct Disk Streaming (Ghi thẳng đĩa, RAM luôn < 10MB)');
+                }
+              } catch (opfsErr) {
+                log(`OPFS không khả dụng (${opfsErr.message}), dùng bộ đệm RAM.`);
+                await cleanupOpfs();
+                useOpfs = false;
+              }
+            }
+
+            if (!useOpfs) {
+              chunks = new Array(meta.totalChunks || 0);
+            }
 
             requestWakeLock();
             log(`Bắt đầu nhận file: ${meta.name} (${formatBytes(meta.size)}) | Checksum gửi: ${meta.checksum.slice(0, 16)}...`);
             UI.transferStatus.textContent = `Đang đợi dữ liệu: ${meta.name}`;
-            // Báo READY để Bên Gửi bắt đầu bơm các chunk 256KB gối đầu
             ws.send('READY');
             return;
           }
@@ -488,7 +528,7 @@ if (UI.btnStartReceive) {
         return;
       }
 
-      // Xử lý Binary Chunk trực tiếp (Zero-copy, đồng bộ, không nghẽn Promise chain)
+      // Xử lý Binary Chunk
       let buffer = e.data;
       if (buffer instanceof Blob) {
         buffer = await buffer.arrayBuffer();
@@ -497,7 +537,6 @@ if (UI.btnStartReceive) {
       if (buffer instanceof ArrayBuffer) {
         if (buffer.byteLength < 4) return;
 
-        // Bắt đầu bấm giờ KHI VỪA NHẬN CHUNK ĐẦU TIÊN (loại bỏ thời gian chờ handshake và đổi tab)
         if (startTime === 0) {
           startTime = performance.now();
           lastSpeedTime = startTime;
@@ -507,12 +546,20 @@ if (UI.btnStartReceive) {
 
         const dv = new DataView(buffer);
         const chunkIndex = dv.getUint32(0, false);
-
-        // Zero-copy: Tạo TypedArray view trực tiếp từ byte thứ 4 mà không copy bộ nhớ
         const chunkData = new Uint8Array(buffer, 4);
 
-        // Gán chunk đúng vị trí chunkIndex tuyệt đối -> không bao giờ bị xáo trộn thứ tự
-        chunks[chunkIndex] = chunkData;
+        if (useOpfs && opfsWritable) {
+          // Ghi đĩa trực tiếp qua OPFS theo vị trí byte offset
+          const offset = chunkIndex * CHUNK_SIZE;
+          opfsWriteQueue = opfsWriteQueue.then(() =>
+            opfsWritable.write({ type: 'write', position: offset, data: chunkData })
+          ).catch(wErr => {
+            log(`Lỗi ghi đĩa OPFS: ${wErr.message}`);
+          });
+        } else {
+          chunks[chunkIndex] = chunkData;
+        }
+
         receivedBytes += chunkData.byteLength;
         chunkCount++;
 
@@ -539,46 +586,69 @@ if (UI.btnStartReceive) {
           lastSpeedBytes = receivedBytes;
         }
 
-        // Khi nhận đủ 100% dữ liệu -> Bắt đầu đối soát Checksum SHA-256
+        // Khi nhận đủ 100% dữ liệu
         if (receivedBytes >= meta.size) {
           const totalSec = Math.max(0.1, (performance.now() - startTime) / 1000);
           const avgSpeed = (meta.size / (1024 * 1024)) / totalSec;
-          UI.transferStatus.textContent = 'Đang đối soát mã Checksum SHA-256...';
+          UI.transferStatus.textContent = 'Đang hoàn tất ghi đĩa và đối soát Checksum...';
           log(`Đã nhận đủ 100% dữ liệu trong ${totalSec.toFixed(1)}s (Tốc độ TB: ${avgSpeed.toFixed(2)} MB/s). Bắt đầu đối soát mã Checksum...`);
 
-          const fullBlob = new Blob(chunks);
-          chunks = []; // giải phóng mảng chunks
+          let targetFileOrBlob = null;
+          const currentOpfsHandle = opfsFileHandle;
+
+          if (useOpfs && opfsWritable) {
+            try {
+              await opfsWriteQueue;
+              await opfsWritable.close();
+              opfsWritable = null;
+              targetFileOrBlob = await currentOpfsHandle.getFile();
+            } catch (closeErr) {
+              log(`Lỗi đóng file OPFS: ${closeErr.message}`);
+            }
+          }
+
+          if (!targetFileOrBlob) {
+            targetFileOrBlob = new Blob(chunks);
+            chunks = [];
+          }
 
           try {
-            const receiverChecksum = await computeChecksum(fullBlob);
+            const receiverChecksum = await computeChecksum(targetFileOrBlob);
             log(`Mã Checksum Bên Nhận tính được: ${receiverChecksum.slice(0, 16)}...`);
 
             if (receiverChecksum === meta.checksum) {
-              // Khớp mã hoàn toàn!
               log(`✅ Khớp mã Checksum SHA-256 hoàn hảo! File nguyên vẹn 100%.`);
               UI.transferStatus.textContent = `🎉 Checksum KHỚP 100%! Đã tải ${meta.name} về máy (${avgSpeed.toFixed(2)} MB/s)`;
 
-              // Báo lại cho Bên Gửi biết là đối soát thành công
               ws.send(JSON.stringify({ type: 'VERIFY_OK', checksum: receiverChecksum, avgSpeed: avgSpeed.toFixed(2) }));
 
-              // Kích hoạt tải file về máy
-              const downloadUrl = URL.createObjectURL(fullBlob);
+              const downloadUrl = URL.createObjectURL(targetFileOrBlob);
               const a = document.createElement('a');
               a.href = downloadUrl;
               a.download = meta.name;
               document.body.appendChild(a);
               a.click();
               document.body.removeChild(a);
+
+              // Dọn file tạm OPFS sau 60s
+              setTimeout(async () => {
+                URL.revokeObjectURL(downloadUrl);
+                if (currentOpfsHandle) {
+                  try { await currentOpfsHandle.remove(); } catch (_) {}
+                }
+              }, 60000);
             } else {
-              // Không khớp mã!
               log(`❌ Lỗi: Mã Checksum không khớp! (Gửi: ${meta.checksum} != Nhận: ${receiverChecksum})`);
               UI.transferStatus.textContent = `⚠️ Cảnh báo: Mã Checksum không khớp! File có thể bị lỗi khi truyền.`;
               ws.send(JSON.stringify({ type: 'VERIFY_FAIL' }));
+              if (currentOpfsHandle) {
+                try { await currentOpfsHandle.remove(); } catch (_) {}
+              }
             }
           } catch (err) {
             log(`Lỗi khi tính checksum bên nhận: ${err.message}`);
             ws.send(JSON.stringify({ type: 'VERIFY_OK' }));
-            const downloadUrl = URL.createObjectURL(fullBlob);
+            const downloadUrl = URL.createObjectURL(targetFileOrBlob);
             const a = document.createElement('a');
             a.href = downloadUrl;
             a.download = meta.name;
@@ -600,6 +670,7 @@ if (UI.btnStartReceive) {
       log('Lỗi kết nối Bên Nhận.');
       UI.transferStatus.textContent = 'Lỗi kết nối máy chủ.';
       UI.btnStartReceive.disabled = false;
+      cleanupOpfs();
       releaseWakeLock();
       stopKeepAlive();
     };
@@ -607,6 +678,7 @@ if (UI.btnStartReceive) {
     ws.onclose = () => {
       log('WebSocket Bên Nhận đã ngắt.');
       UI.btnStartReceive.disabled = false;
+      cleanupOpfs();
       releaseWakeLock();
       stopKeepAlive();
     };
