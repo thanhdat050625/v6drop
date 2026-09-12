@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"log"
 	"net/http"
 	"os"
@@ -178,6 +179,10 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 				case msg, ok := <-q:
 					if !ok {
 						return
+					}
+					// Ghi số chunk hiện tại trong queue vào header (offset 4..6) để Receiver hiển thị trực tiếp
+					if msg.MsgType == websocket.BinaryMessage && len(msg.Data) >= 6 {
+						binary.BigEndian.PutUint16(msg.Data[4:6], uint16(len(q)))
 					}
 					if err := rcvConn.WriteMessage(msg.MsgType, msg.Data); err != nil {
 						log.Printf("[%s] Lỗi gửi chunk tới Receiver: %v -> Ngắt kết nối Receiver\n", roomID, err)

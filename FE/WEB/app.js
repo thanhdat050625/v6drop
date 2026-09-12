@@ -36,6 +36,8 @@ const UI = {
   metricTransferred: document.getElementById('metricTransferred'),
   metricEta: document.getElementById('metricEta'),
   metricChunks: document.getElementById('metricChunks'),
+  metricServerQueue: document.getElementById('metricServerQueue'),
+  metricDiskQueue: document.getElementById('metricDiskQueue'),
   btnToggleLog: document.getElementById('btnToggleLog'),
   logToggleIcon: document.getElementById('logToggleIcon'),
   logConsole: document.getElementById('logConsole')
@@ -312,10 +314,11 @@ function uploadFilePipelined(file, checksum) {
         const buf = await readBlobAsArrayBuffer(slice);
         if (!isTransferring || ws.readyState !== WebSocket.OPEN) break;
 
-        const packet = new Uint8Array(4 + buf.byteLength);
+        const packet = new Uint8Array(6 + buf.byteLength);
         const dv = new DataView(packet.buffer);
         dv.setUint32(0, chunkIndex, false);
-        packet.set(new Uint8Array(buf), 4);
+        dv.setUint16(4, 0, false); // placeholder cho server điền len(q)
+        packet.set(new Uint8Array(buf), 6);
 
         ws.send(packet.buffer);
         sentChunks++;
@@ -470,6 +473,9 @@ if (UI.btnStartReceive) {
 
     const writeOpfsSequential = async (chunkData) => {
       opfsBuffer.push(chunkData);
+      if (UI.metricDiskQueue) {
+        UI.metricDiskQueue.textContent = `${opfsBuffer.length} chunk`;
+      }
       if (isOpfsWriting) return;
       isOpfsWriting = true;
       while (opfsBuffer.length > 0) {
@@ -480,8 +486,14 @@ if (UI.btnStartReceive) {
         } catch (err) {
           log(`Lỗi ghi đĩa OPFS: ${err.message}`);
         }
+        if (UI.metricDiskQueue) {
+          UI.metricDiskQueue.textContent = `${opfsBuffer.length} chunk`;
+        }
       }
       isOpfsWriting = false;
+      if (UI.metricDiskQueue) {
+        UI.metricDiskQueue.textContent = `${opfsBuffer.length} chunk`;
+      }
     };
 
     const cleanupOpfs = async () => {
@@ -562,7 +574,7 @@ if (UI.btnStartReceive) {
       }
 
       if (buffer instanceof ArrayBuffer) {
-        if (buffer.byteLength < 4) return;
+        if (buffer.byteLength < 6) return;
 
         if (startTime === 0) {
           startTime = performance.now();
@@ -573,13 +585,21 @@ if (UI.btnStartReceive) {
 
         const dv = new DataView(buffer);
         const chunkIndex = dv.getUint32(0, false);
-        const chunkData = new Uint8Array(buffer, 4);
+        const serverQueue = dv.getUint16(4, false);
+        const chunkData = new Uint8Array(buffer, 6);
+
+        if (UI.metricServerQueue) {
+          UI.metricServerQueue.textContent = `${serverQueue} / 32`;
+        }
 
         if (useOpfs && opfsWritable) {
           // Ghi tuần tự trực tiếp vào đĩa (Native Streaming Append)
           writeOpfsSequential(chunkData);
         } else {
           chunks[chunkIndex] = chunkData;
+          if (UI.metricDiskQueue) {
+            UI.metricDiskQueue.textContent = 'RAM';
+          }
         }
 
         receivedBytes += chunkData.byteLength;
@@ -646,6 +666,9 @@ if (UI.btnStartReceive) {
               UI.transferStatus.textContent = `🎉 Checksum KHỚP 100%! Đã tải ${meta.name} về máy (${avgSpeed.toFixed(2)} MB/s)`;
 
               ws.send(JSON.stringify({ type: 'VERIFY_OK', checksum: receiverChecksum, avgSpeed: avgSpeed.toFixed(2) }));
+
+              if (UI.metricServerQueue) UI.metricServerQueue.textContent = '0 / 32';
+              if (UI.metricDiskQueue) UI.metricDiskQueue.textContent = '0 chunk';
 
               const downloadUrl = URL.createObjectURL(targetFileOrBlob);
               const a = document.createElement('a');
