@@ -213,8 +213,9 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 
 		if role == "sender" {
 			// Nếu là tin nhắn TextMessage (Metadata JSON...):
-			// Gửi trực tiếp cho Receiver ngay lập tức, không chiếm slot của chunk trong Queue
+			// Xả sạch queue cũ nếu có trước khi bắt đầu phiên truyền mới
 			if msgType == websocket.TextMessage {
+				drainQueue(room.Queue)
 				room.Lock.Lock()
 				rcv := room.Receiver
 				room.Lock.Unlock()
@@ -239,7 +240,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 				case <-time.After(20 * time.Second):
 					log.Printf("[%s] Queue đầy quá 20s (Receiver nghẽn). Báo ngắt kết nối cho Sender\n", roomID)
 					_ = sConn.WriteMessage(websocket.TextMessage, []byte(`{"type":"PEER_DISCONNECTED","role":"receiver"}`))
-					break
+					return
 				}
 			}
 		} else {

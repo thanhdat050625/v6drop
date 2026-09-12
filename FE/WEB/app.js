@@ -38,6 +38,8 @@ const UI = {
   metricChunks: document.getElementById('metricChunks'),
   metricServerQueue: document.getElementById('metricServerQueue'),
   metricDiskQueue: document.getElementById('metricDiskQueue'),
+  metricServerQueueItem: document.getElementById('metricServerQueueItem'),
+  metricDiskQueueItem: document.getElementById('metricDiskQueueItem'),
   btnToggleLog: document.getElementById('btnToggleLog'),
   logToggleIcon: document.getElementById('logToggleIcon'),
   logConsole: document.getElementById('logConsole')
@@ -175,12 +177,16 @@ function updateRoute() {
     UI.tabGui.className = 'mode-tab';
     UI.viewGui.style.display = 'none';
     UI.viewNhan.style.display = 'block';
+    if (UI.metricServerQueueItem) UI.metricServerQueueItem.style.display = 'block';
+    if (UI.metricDiskQueueItem) UI.metricDiskQueueItem.style.display = 'block';
     log('Chuyển sang chế độ: Bên Nhận (/nhan)');
   } else {
     UI.tabGui.className = 'mode-tab active-sender';
     UI.tabNhan.className = 'mode-tab';
     UI.viewGui.style.display = 'block';
     UI.viewNhan.style.display = 'none';
+    if (UI.metricServerQueueItem) UI.metricServerQueueItem.style.display = 'none';
+    if (UI.metricDiskQueueItem) UI.metricDiskQueueItem.style.display = 'none';
     log('Chuyển sang chế độ: Bên Gửi (/gui)');
   }
 }
@@ -280,11 +286,15 @@ function uploadFilePipelined(file, checksum) {
   let lastSpeedBytes = 0;
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
   let isTransferring = true;
+  let isStreamingStarted = false; // Chống kích hoạt luồng truyền kép
 
   // Giới hạn buffer tạm trong máy gửi là 4MB (bơm liên tục không cần chờ ACK)
   const MAX_BUFFERED_AMOUNT = 4 * 1024 * 1024;
 
   async function startStreaming() {
+    if (isStreamingStarted) return;
+    isStreamingStarted = true;
+
     startTime = performance.now();
     lastSpeedTime = startTime;
     lastSpeedBytes = 0;
@@ -366,10 +376,8 @@ function uploadFilePipelined(file, checksum) {
     }
   }
 
-  ws.onopen = () => {
-    log('Đã nối Go Relay! Gửi thông tin Metadata & Checksum...');
-    startKeepAlive();
-    requestWakeLock();
+  const sendMeta = () => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const meta = {
       name: file.name,
       size: file.size,
@@ -377,6 +385,13 @@ function uploadFilePipelined(file, checksum) {
       totalChunks: totalChunks
     };
     ws.send(JSON.stringify(meta));
+  };
+
+  ws.onopen = () => {
+    log('Đã nối Go Relay! Gửi thông tin Metadata & Checksum...');
+    startKeepAlive();
+    requestWakeLock();
+    sendMeta();
     UI.transferStatus.textContent = 'Đã gửi Metadata. Đang đợi Bên Nhận vào phòng...';
   };
 
@@ -385,6 +400,10 @@ function uploadFilePipelined(file, checksum) {
       if (e.data === '{"type":"pong"}') return;
 
       if (e.data === 'READY') {
+        if (isStreamingStarted) {
+          log('Đã nhận READY nhưng luồng gửi đang chạy, bỏ qua.');
+          return;
+        }
         log(`Bên Nhận đã sẵn sàng! Bắt đầu truyền dữ liệu siêu tốc liên tục...`);
         UI.transferStatus.textContent = `Đang truyền: ${file.name}`;
         startStreaming();
@@ -394,15 +413,9 @@ function uploadFilePipelined(file, checksum) {
       try {
         const parsed = JSON.parse(e.data);
         if (parsed.type === 'PEER_CONNECTED' && parsed.role === 'receiver') {
-          log('Bên Nhận đã vào phòng!');
+          log('Bên Nhận đã vào phòng! Gửi Metadata...');
           UI.transferStatus.textContent = 'Bên Nhận đã vào phòng. Gửi Metadata & Checksum...';
-          const meta = {
-            name: file.name,
-            size: file.size,
-            checksum: checksum,
-            totalChunks: totalChunks
-          };
-          ws.send(JSON.stringify(meta));
+          sendMeta();
         } else if (parsed.type === 'PEER_DISCONNECTED') {
           log('Bên Nhận đã ngắt kết nối.');
           UI.transferStatus.textContent = 'Bên Nhận vừa ngắt kết nối.';
@@ -523,6 +536,12 @@ if (UI.btnStartReceive) {
         try {
           const parsed = JSON.parse(e.data);
           if (parsed.name && parsed.size) {
+            // Nếu đã và đang nhận đúng file này rồi thì không reset lại từ đầu
+            if (meta && meta.checksum === parsed.checksum && chunkCount > 0) {
+              log('Đã nhận metadata file này, giữ nguyên tiến trình đang truyền.');
+              return;
+            }
+
             meta = parsed;
             receivedBytes = 0;
             chunkCount = 0;
@@ -533,6 +552,8 @@ if (UI.btnStartReceive) {
             useOpfs = false;
             opfsBuffer = [];
             isOpfsWriting = false;
+
+            await cleanupOpfs();
 
             // Khởi tạo OPFS Direct Disk Streaming nếu trình duyệt hỗ trợ
             if (navigator.storage && typeof navigator.storage.getDirectory === 'function') {
@@ -580,7 +601,9 @@ if (UI.btnStartReceive) {
           startTime = performance.now();
           lastSpeedTime = startTime;
           lastSpeedBytes = 0;
-          UI.transferStatus.textContent = `Đang nhận: ${meta.name}`;
+          if (meta) {
+            UI.transferStatus.textContent = `Đang nhận: ${meta.name}`;
+          }
         }
 
         const dv = new DataView(buffer);
@@ -606,19 +629,21 @@ if (UI.btnStartReceive) {
         chunkCount++;
 
         const now = performance.now();
-        const progress = Math.min(100, (receivedBytes / meta.size) * 100);
+        const totalSize = meta ? meta.size : receivedBytes;
+        const totalChunksDisplay = meta ? (meta.totalChunks || '?') : '?';
+        const progress = meta && meta.size > 0 ? Math.min(100, (receivedBytes / meta.size) * 100) : 0;
 
         UI.progressBar.style.width = `${progress}%`;
         UI.transferPercent.textContent = `${progress.toFixed(1)}%`;
-        UI.metricTransferred.textContent = `${formatBytes(receivedBytes)} / ${formatBytes(meta.size)}`;
-        UI.metricChunks.textContent = `${chunkCount} / ${meta.totalChunks || '?'}`;
+        UI.metricTransferred.textContent = `${formatBytes(receivedBytes)} / ${formatBytes(totalSize)}`;
+        UI.metricChunks.textContent = `${chunkCount} / ${totalChunksDisplay}`;
 
         if (now - lastSpeedTime >= 300) {
           const bytesSec = (receivedBytes - lastSpeedBytes) / ((now - lastSpeedTime) / 1000);
           const mbSec = bytesSec / (1024 * 1024);
           UI.metricSpeed.textContent = `${mbSec.toFixed(2)} MB/s`;
 
-          if (bytesSec > 0) {
+          if (bytesSec > 0 && meta && meta.size > receivedBytes) {
             const secLeft = (meta.size - receivedBytes) / bytesSec;
             const m = Math.floor(secLeft / 60);
             const s = Math.floor(secLeft % 60);
@@ -629,7 +654,7 @@ if (UI.btnStartReceive) {
         }
 
         // Khi nhận đủ 100% dữ liệu
-        if (receivedBytes >= meta.size) {
+        if (meta && receivedBytes >= meta.size) {
           const totalSec = Math.max(0.1, (performance.now() - startTime) / 1000);
           const avgSpeed = (meta.size / (1024 * 1024)) / totalSec;
           UI.transferStatus.textContent = 'Đang hoàn tất ghi đĩa và đối soát Checksum...';
