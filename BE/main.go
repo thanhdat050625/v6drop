@@ -1,21 +1,18 @@
 package main
 
 import (
-	"encoding/binary"
 	"log"
 	"net/http"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// Giới hạn tối đa 32 chunk trong RAM (32 * 256KB = 8.0MB RAM)
-// Cho phép truyền streaming liên tục (continuous pipelining), tận dụng tối đa băng thông TCP
-const MaxChunksInRam = 32
-
-const writeWait = 20 * time.Second
+// Giới hạn tối đa 8 chunk trong RAM (8 * 256KB = 2.0MB RAM)
+// Cho phép truyền gối đầu (pipelining): Server luôn duy trì tối đa 8 chunk,
+// cứ thiếu 1 chunk là server báo ACK để bên gửi bơm bù ngay lập tức!
+const MaxChunksInRam = 8
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024 * 1024,
@@ -38,7 +35,6 @@ func NewSafeConn(conn *websocket.Conn) *SafeConn {
 func (s *SafeConn) WriteMessage(messageType int, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_ = s.conn.SetWriteDeadline(time.Now().Add(writeWait))
 	return s.conn.WriteMessage(messageType, data)
 }
 
@@ -172,28 +168,35 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		rcvStop := make(chan struct{})
 		defer close(rcvStop)
 
-		// Goroutine chuyên trách đọc từ Queue (tối đa 32 chunk) và gửi ra Receiver liên tục
-		go func(rcvConn *SafeConn, q chan RelayMessage, stop chan struct{}) {
+		// Goroutine chuyên trách đọc từ Queue (tối đa 8 chunk) và gửi ra Receiver liên tục
+		go func(rcvConn *SafeConn, q chan RelayMessage, stop chan struct{}, rm *Room) {
 			for {
 				select {
 				case msg, ok := <-q:
 					if !ok {
 						return
 					}
-					// Ghi số chunk hiện tại trong queue vào header (offset 4..6) để Receiver hiển thị trực tiếp
-					if msg.MsgType == websocket.BinaryMessage && len(msg.Data) >= 6 {
-						binary.BigEndian.PutUint16(msg.Data[4:6], uint16(len(q)))
+					// Ngay khi Server lấy 1 chunk ra khỏi RAM -> hàng đợi vừa trống 1 slot (< MaxChunksInRam)!
+					// Gửi ngay ACK cho Sender trong goroutine chạy song song để Sender bơm tiếp chunk mới bù vào,
+					// trong lúc goroutine này đang truyền chunk dữ liệu cho Receiver (True Parallel Pipeline!)
+					if msg.MsgType == websocket.BinaryMessage {
+						rm.Lock.Lock()
+						snd := rm.Sender
+						rm.Lock.Unlock()
+						if snd != nil {
+							go func(s *SafeConn) {
+								_ = s.WriteMessage(websocket.TextMessage, []byte("ACK"))
+							}(snd)
+						}
 					}
 					if err := rcvConn.WriteMessage(msg.MsgType, msg.Data); err != nil {
-						log.Printf("[%s] Lỗi gửi chunk tới Receiver: %v -> Ngắt kết nối Receiver\n", roomID, err)
-						_ = rcvConn.Close()
 						return
 					}
 				case <-stop:
 					return
 				}
 			}
-		}(sConn, room.Queue, rcvStop)
+		}(sConn, room.Queue, rcvStop, room)
 	}
 	room.Lock.Unlock()
 
@@ -213,9 +216,8 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 
 		if role == "sender" {
 			// Nếu là tin nhắn TextMessage (Metadata JSON...):
-			// Xả sạch queue cũ nếu có trước khi bắt đầu phiên truyền mới
+			// Gửi trực tiếp cho Receiver ngay lập tức, không chiếm slot của chunk trong Queue
 			if msgType == websocket.TextMessage {
-				drainQueue(room.Queue)
 				room.Lock.Lock()
 				rcv := room.Receiver
 				room.Lock.Unlock()
@@ -223,25 +225,9 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 					_ = rcv.WriteMessage(msgType, data)
 				}
 			} else {
-				// Kiểm tra xem Receiver có đang trong phòng không
-				room.Lock.Lock()
-				rcv := room.Receiver
-				room.Lock.Unlock()
-
-				if rcv == nil {
-					_ = sConn.WriteMessage(websocket.TextMessage, []byte(`{"type":"PEER_DISCONNECTED","role":"receiver"}`))
-					break
-				}
-
-				// Binary chunk dữ liệu -> Đưa vào Queue (tối đa MaxChunksInRam = 32)
-				// Đặt timeout 20s để không bao giờ bị Deadlock treo cứng nếu Receiver ngừng đọc TCP
-				select {
-				case room.Queue <- RelayMessage{MsgType: msgType, Data: data}:
-				case <-time.After(20 * time.Second):
-					log.Printf("[%s] Queue đầy quá 20s (Receiver nghẽn). Báo ngắt kết nối cho Sender\n", roomID)
-					_ = sConn.WriteMessage(websocket.TextMessage, []byte(`{"type":"PEER_DISCONNECTED","role":"receiver"}`))
-					return
-				}
+				// Binary chunk dữ liệu -> Đưa vào Queue (tối đa MaxChunksInRam = 8)
+				// Nếu trong RAM đã có đủ 8 chunk, dòng này tự động BLOCK (Backpressure tự nhiên của TCP)
+				room.Queue <- RelayMessage{MsgType: msgType, Data: data}
 			}
 		} else {
 			// BÊN NHẬN -> BÊN GỬI (Tín hiệu điều khiển: READY, VERIFY_OK, VERIFY_FAIL...)
