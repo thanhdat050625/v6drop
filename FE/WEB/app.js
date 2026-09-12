@@ -291,9 +291,16 @@ function uploadFilePipelined(file, checksum) {
       if (!isTransferring || ws.readyState !== WebSocket.OPEN) break;
 
       // Native Backpressure: Nếu buffer socket của trình duyệt > 4MB thì chờ card mạng xả bớt
+      const waitStart = performance.now();
       while (ws.bufferedAmount > MAX_BUFFERED_AMOUNT) {
         await new Promise(r => setTimeout(r, 5));
         if (!isTransferring || ws.readyState !== WebSocket.OPEN) break;
+        if (performance.now() - waitStart > 25000) {
+          log('⚠️ Socket bị nghẽn quá 25s (Bên Nhận hoặc mạng không phản hồi).');
+          UI.transferStatus.textContent = 'Mạng bị nghẽn quá 25s. Đã dừng truyền.';
+          isTransferring = false;
+          break;
+        }
       }
       if (!isTransferring || ws.readyState !== WebSocket.OPEN) break;
 
@@ -458,9 +465,28 @@ if (UI.btnStartReceive) {
     let opfsFileHandle = null;
     let opfsWritable = null;
     let useOpfs = false;
-    let opfsWriteQueue = Promise.resolve();
+    let opfsBuffer = [];
+    let isOpfsWriting = false;
+
+    const writeOpfsSequential = async (chunkData) => {
+      opfsBuffer.push(chunkData);
+      if (isOpfsWriting) return;
+      isOpfsWriting = true;
+      while (opfsBuffer.length > 0) {
+        const next = opfsBuffer.shift();
+        try {
+          // Ghi tuần tự trực tiếp (Native Streaming Append), không seek vị trí, tốc độ 100+ MB/s
+          await opfsWritable.write(next);
+        } catch (err) {
+          log(`Lỗi ghi đĩa OPFS: ${err.message}`);
+        }
+      }
+      isOpfsWriting = false;
+    };
 
     const cleanupOpfs = async () => {
+      opfsBuffer = [];
+      isOpfsWriting = false;
       if (opfsWritable) {
         try { await opfsWritable.abort(); } catch (_) {}
         opfsWritable = null;
@@ -493,7 +519,8 @@ if (UI.btnStartReceive) {
             lastSpeedBytes = 0;
             chunks = [];
             useOpfs = false;
-            opfsWriteQueue = Promise.resolve();
+            opfsBuffer = [];
+            isOpfsWriting = false;
 
             // Khởi tạo OPFS Direct Disk Streaming nếu trình duyệt hỗ trợ
             if (navigator.storage && typeof navigator.storage.getDirectory === 'function') {
@@ -549,13 +576,8 @@ if (UI.btnStartReceive) {
         const chunkData = new Uint8Array(buffer, 4);
 
         if (useOpfs && opfsWritable) {
-          // Ghi đĩa trực tiếp qua OPFS theo vị trí byte offset
-          const offset = chunkIndex * CHUNK_SIZE;
-          opfsWriteQueue = opfsWriteQueue.then(() =>
-            opfsWritable.write({ type: 'write', position: offset, data: chunkData })
-          ).catch(wErr => {
-            log(`Lỗi ghi đĩa OPFS: ${wErr.message}`);
-          });
+          // Ghi tuần tự trực tiếp vào đĩa (Native Streaming Append)
+          writeOpfsSequential(chunkData);
         } else {
           chunks[chunkIndex] = chunkData;
         }
@@ -598,7 +620,10 @@ if (UI.btnStartReceive) {
 
           if (useOpfs && opfsWritable) {
             try {
-              await opfsWriteQueue;
+              // Chờ xả hết buffer ghi đĩa trước khi đóng file
+              while (isOpfsWriting || opfsBuffer.length > 0) {
+                await new Promise(r => setTimeout(r, 10));
+              }
               await opfsWritable.close();
               opfsWritable = null;
               targetFileOrBlob = await currentOpfsHandle.getFile();

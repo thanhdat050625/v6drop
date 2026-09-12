@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -12,6 +13,8 @@ import (
 // Giới hạn tối đa 32 chunk trong RAM (32 * 256KB = 8.0MB RAM)
 // Cho phép truyền streaming liên tục (continuous pipelining), tận dụng tối đa băng thông TCP
 const MaxChunksInRam = 32
+
+const writeWait = 20 * time.Second
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024 * 1024,
@@ -34,6 +37,7 @@ func NewSafeConn(conn *websocket.Conn) *SafeConn {
 func (s *SafeConn) WriteMessage(messageType int, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	_ = s.conn.SetWriteDeadline(time.Now().Add(writeWait))
 	return s.conn.WriteMessage(messageType, data)
 }
 
@@ -176,6 +180,8 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 						return
 					}
 					if err := rcvConn.WriteMessage(msg.MsgType, msg.Data); err != nil {
+						log.Printf("[%s] Lỗi gửi chunk tới Receiver: %v -> Ngắt kết nối Receiver\n", roomID, err)
+						_ = rcvConn.Close()
 						return
 					}
 				case <-stop:
@@ -211,9 +217,25 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 					_ = rcv.WriteMessage(msgType, data)
 				}
 			} else {
+				// Kiểm tra xem Receiver có đang trong phòng không
+				room.Lock.Lock()
+				rcv := room.Receiver
+				room.Lock.Unlock()
+
+				if rcv == nil {
+					_ = sConn.WriteMessage(websocket.TextMessage, []byte(`{"type":"PEER_DISCONNECTED","role":"receiver"}`))
+					break
+				}
+
 				// Binary chunk dữ liệu -> Đưa vào Queue (tối đa MaxChunksInRam = 32)
-				// Nếu trong RAM đã có đủ 32 chunk, dòng này tự động BLOCK (Backpressure tự nhiên của TCP)
-				room.Queue <- RelayMessage{MsgType: msgType, Data: data}
+				// Đặt timeout 20s để không bao giờ bị Deadlock treo cứng nếu Receiver ngừng đọc TCP
+				select {
+				case room.Queue <- RelayMessage{MsgType: msgType, Data: data}:
+				case <-time.After(20 * time.Second):
+					log.Printf("[%s] Queue đầy quá 20s (Receiver nghẽn). Báo ngắt kết nối cho Sender\n", roomID)
+					_ = sConn.WriteMessage(websocket.TextMessage, []byte(`{"type":"PEER_DISCONNECTED","role":"receiver"}`))
+					break
+				}
 			}
 		} else {
 			// BÊN NHẬN -> BÊN GỬI (Tín hiệu điều khiển: READY, VERIFY_OK, VERIFY_FAIL...)
